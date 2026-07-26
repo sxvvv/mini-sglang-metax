@@ -1,7 +1,3 @@
-<p align="center">
-  <img width="360" src="assets/logo.png" alt="Mini-SGLang">
-</p>
-
 # mini-sglang-metax
 
 A correctness-first port of Mini-SGLang to MetaX C500/C550 and the MACA
