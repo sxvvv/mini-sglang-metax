@@ -8,7 +8,7 @@ version = "0.1.0a1"
 description = "Correctness-first Mini-SGLang port for MetaX MACA accelerators."
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
+license = {text = "MIT"}
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
