@@ -46,7 +46,7 @@ class VocabParallelEmbedding(BaseOP):
                 self._comm.all_reduce(y)
             return y
 
-        # NPU / CPU — pure PyTorch gather. No index dtype coercion.
+        # MetaX / CPU — pure PyTorch gather. No index dtype coercion.
         if tp_size == 1:
             return F.embedding(x, self.weight)
 

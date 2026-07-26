@@ -63,17 +63,6 @@ def _load_flashinfer_apply_rope():
     return apply_rope_with_cos_sin_cache_inplace
 
 
-def _load_torch_npu():
-    try:
-        import torch_npu
-    except ImportError as exc:
-        raise RuntimeError(
-            "NPU RoPE requires torch_npu to be importable; install "
-            "torch_npu on the host to use RotaryEmbedding on NPU tensors."
-        ) from exc
-    return torch_npu
-
-
 # ---------------------------------------------------------- RotaryEmbedding
 class RotaryEmbedding(StateLessOP):
     def __init__(
@@ -89,7 +78,7 @@ class RotaryEmbedding(StateLessOP):
         super().__init__()
         self.head_size = head_size
         # ``rotary_dim`` is asserted equal to ``head_size`` in the current
-        # model zoo; kept as a distinct attribute so the NPU/CPU helpers can
+        # model zoo; kept as a distinct attribute so the CPU/MetaX helpers can
         # split the cache along the rotary axis without recomputing ``//2``.
         self.rotary_dim = rotary_dim
         assert rotary_dim == head_size
@@ -101,7 +90,7 @@ class RotaryEmbedding(StateLessOP):
         cos = freqs.cos()
         sin = freqs.sin()
         # buffer, so don't load/save. FlashInfer stores (cos | sin) along the
-        # last dim; the NPU/CPU paths re-split and duplicate each half to
+        # last dim; the CPU/MetaX path re-splits and duplicates each half to
         # reach the full rotary_dim used by NeoX rotate_half.
         self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
         assert self.head_size in [64, 128, 256, 512]
@@ -128,29 +117,7 @@ class RotaryEmbedding(StateLessOP):
             )
             return query, key
 
-        if device_type == "npu":
-            torch_npu = _load_torch_npu()
-            cos_full, sin_full = _cos_sin_full_from_cache(
-                self._cos_sin_cache, positions, self.rotary_dim
-            )
-            cos_full = cos_full.to(dtype=query.dtype)
-            sin_full = sin_full.to(dtype=query.dtype)
-            T = query.shape[0]
-            Hq = query.shape[1]
-            Hk = key.shape[1]
-            D = self.head_size
-            q_4d = query.view(1, T, Hq, D)
-            k_4d = key.view(1, T, Hk, D)
-            cos_4d = cos_full.view(1, T, 1, D)
-            sin_4d = sin_full.view(1, T, 1, D)
-            # npu_rotary_mul with rotary_mode="half" is NeoX rotate_half; it
-            # returns a fresh allocation, so inputs are untouched (no copy_,
-            # no clone, no contiguous).
-            q_rot = torch_npu.npu_rotary_mul(q_4d, cos_4d, sin_4d, rotary_mode="half")
-            k_rot = torch_npu.npu_rotary_mul(k_4d, cos_4d, sin_4d, rotary_mode="half")
-            return q_rot.squeeze(0), k_rot.squeeze(0)
-
-        # CPU path — pure PyTorch NeoX rotate_half with fp32 mid-calc.
+        # CPU / MetaX path — pure PyTorch NeoX rotate_half with fp32 mid-calc.
         cos_full, sin_full = _cos_sin_full_from_cache(
             self._cos_sin_cache, positions, self.rotary_dim
         )
@@ -245,12 +212,12 @@ def _normalize_device(device: torch.device) -> torch.device:
     * ``cpu`` and ``meta`` collapse to type-only — they have no meaningful
       index and ``torch.device('cpu')`` / ``torch.device('cpu', 0)`` would
       otherwise key different cache entries.
-    * Accelerator devices (cuda, npu, xpu, mps, …) **must** carry an
-      explicit index. Silently mapping ``torch.device('npu')`` to
-      ``torch.device('npu', 0)`` would mask real bugs on multi-rank hosts
-      where the intended device is ``npu:{local_rank}``. Production Engine
-      always passes ``cuda:{rank}`` / ``npu:{rank}`` via
-      ``bind_local_device``, so this stays a no-op for the real call site.
+    * Accelerator devices (cuda, xpu, mps, …) **must** carry an
+      explicit index. Silently mapping ``torch.device('cuda')`` to
+      ``torch.device('cuda', 0)`` would mask real bugs on multi-rank hosts
+      where the intended device is ``cuda:{local_rank}``. Production Engine
+      always passes ``cuda:{rank}`` via ``bind_local_device``, so this stays
+      a no-op for the real call site.
 
     Raises:
         ValueError: if ``device`` is an accelerator without an explicit
@@ -273,8 +240,8 @@ def _resolve_rope_device() -> torch.device:
 
     1. If :func:`set_rope_device` has been called, honour it — even when the
        ambient default device is CPU. This lets the Engine populate the
-       cache on ``npu:0`` before opening ``with torch.device('meta')`` and
-       ensures the same call outside a meta scope still lands on ``npu:0``.
+       cache on ``cuda:0`` before opening ``with torch.device('meta')`` and
+       ensures the same call outside a meta scope still lands on ``cuda:0``.
     2. Otherwise use ``torch.tensor([]).device`` (the ambient default).
     3. If the ambient default is ``meta`` and no setter is registered,
        raise ``RuntimeError``. A meta cache cannot back any forward path.
@@ -285,7 +252,7 @@ def _resolve_rope_device() -> torch.device:
     if current.type == "meta":
         raise RuntimeError(
             "Cannot construct RoPE on meta device. Call set_rope_device(...) "
-            "with a concrete target device (e.g. torch.device('npu:0')) "
+            "with a concrete target device (e.g. torch.device('cuda:0')) "
             "before entering a ``with torch.device('meta'):`` scope."
         )
     return _normalize_device(current)
@@ -321,7 +288,7 @@ def _get_rope_cached(
 ) -> RotaryEmbedding:
     """One ``RotaryEmbedding`` per (dims, base, scaling, device) tuple.
 
-    ``device`` is part of the cache key so ``cpu`` / ``npu:0`` / ``npu:1``
+    ``device`` is part of the cache key so ``cpu`` / ``cuda:0`` / ``cuda:1``
     populations never alias. First-writer-wins semantics are eliminated:
     two consecutive calls with the same parameters but different devices
     each get their own module, and each stays on its intended device.

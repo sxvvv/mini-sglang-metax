@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Literal
-
 import torch
 from minisgl.distributed import get_tp_info
 from minisgl.utils import div_even
@@ -25,27 +23,16 @@ class MHAKVCache(BaseKVCachePool):
         page_size: int,
         dtype: torch.dtype,
         device: torch.device,
-        layout: Literal["nhd", "bnbsd"] = "nhd",
     ) -> None:
-        if layout not in ("nhd", "bnbsd"):
-            raise ValueError(
-                f"MHAKVCache layout must be 'nhd' or 'bnbsd', got {layout!r}"
-            )
         tp_info = get_tp_info()
         local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
-        if layout == "nhd":
-            self._kv_buffer = torch.empty(
-                (2, num_layers, num_pages, page_size, local_kv_heads, head_dim),
-                device=device,
-                dtype=dtype,
-            )
-        else:  # bnbsd — FIA paged-KV native layout on Ascend
-            self._kv_buffer = torch.empty(
-                (2, num_layers, num_pages, local_kv_heads, page_size, head_dim),
-                device=device,
-                dtype=dtype,
-            )
-        self._layout = layout
+        # nhd layout — the natural CUDA / MetaX paged-KV shape:
+        # (2, num_layers, num_pages, page_size, local_kv_heads, head_dim).
+        self._kv_buffer = torch.empty(
+            (2, num_layers, num_pages, page_size, local_kv_heads, head_dim),
+            device=device,
+            dtype=dtype,
+        )
         self._page_size = page_size
         self._local_kv_heads = local_kv_heads
         self._head_dim = head_dim
@@ -64,7 +51,11 @@ class MHAKVCache(BaseKVCachePool):
     def store_kv(
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
     ) -> None:
-        if self._layout == "nhd" and not is_metax_platform():
+        # device_type=cuda vs platform=metax split: NVIDIA CUDA uses the fused
+        # ``store_cache`` kernel from the CUDA-only ``minisgl.kernel`` package;
+        # MetaX has no such compiled artefact, so it scatters with pure PyTorch
+        # ``index_copy_`` instead.
+        if not is_metax_platform():
             from minisgl.kernel import store_cache
 
             store_cache(
@@ -74,20 +65,13 @@ class MHAKVCache(BaseKVCachePool):
                 k=k,
                 v=v,
             )
-        elif self._layout == "nhd":
+        else:
             k_cache = self._k_buffer[layer_id].view(self._storage_shape)
             v_cache = self._v_buffer[layer_id].view(self._storage_shape)
             locations = out_loc.long()
             values_shape = (-1, self._local_kv_heads, self._head_dim)
             k_cache.index_copy_(0, locations, k.reshape(values_shape))
             v_cache.index_copy_(0, locations, v.reshape(values_shape))
-        else:  # bnbsd — pure PyTorch scatter, no CUDA kernel dependency
-            page_ids = out_loc // self._page_size
-            offsets = out_loc % self._page_size
-            k_values = k.view(-1, self._local_kv_heads, self._head_dim)
-            v_values = v.view(-1, self._local_kv_heads, self._head_dim)
-            self._k_buffer[layer_id][page_ids, :, offsets, :] = k_values
-            self._v_buffer[layer_id][page_ids, :, offsets, :] = v_values
 
     @property
     def device(self) -> torch.device:

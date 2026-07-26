@@ -78,7 +78,7 @@ class Scheduler(SchedulerIOMixin):
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
         # Stream lifecycle routes through the shared device_runtime dispatch so
-        # cuda / npu / cpu hosts all follow the same call graph. Engine already
+        # cuda / cpu hosts all follow the same call graph. Engine already
         # committed to this layer for its own stream — Scheduler reuses the
         # engine's device_type so the two managers can never drift apart.
         self.device_type = self.engine.device_type
@@ -567,9 +567,19 @@ class Scheduler(SchedulerIOMixin):
         return forward_output
 
 
+def _can_pin(device: torch.device) -> bool:
+    """True only when a pinned-memory allocator is available for *device*.
+
+    ``pin_memory=True`` requires a CUDA (or compatible) backend; on CPU-only
+    builds it raises RuntimeError.  MetaX exposes the torch.cuda API so
+    ``device.type == "cuda"`` is the right gate for both NVIDIA and MetaX.
+    """
+    return device.type == "cuda" and torch.cuda.is_available()
+
+
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
     needed_size = sum(r.extend_len for r in batch.padded_reqs)
-    indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
+    indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=_can_pin(device))
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
@@ -584,7 +594,7 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
+    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=_can_pin(device))
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
@@ -595,7 +605,7 @@ def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
 
 def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
     mapping_list = [req.table_idx for req in batch.reqs]
-    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
+    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=_can_pin(device))
     write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
-    write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
+    write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=_can_pin(device))
     return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)

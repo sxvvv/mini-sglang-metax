@@ -40,15 +40,6 @@ def create_fa_backend(config: ModelConfig):
     return FlashAttentionBackend(config)
 
 
-@SUPPORTED_ATTENTION_BACKENDS.register("npu_fia")
-def create_npu_fia_backend(config: ModelConfig):
-    # Lazy import: only reached when the caller explicitly selects "npu_fia".
-    # This keeps ascend_fia.py off the import path for pure-CUDA runs.
-    from .ascend_fia import AscendFIABackend
-
-    return AscendFIABackend(config)
-
-
 @SUPPORTED_ATTENTION_BACKENDS.register("torch_native")
 def create_torch_native_backend(config: ModelConfig):
     from .torch_native import TorchNativeAttentionBackend

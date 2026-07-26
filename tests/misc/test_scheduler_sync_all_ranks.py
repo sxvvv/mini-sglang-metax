@@ -4,13 +4,13 @@ no CPU process group.
 The guard is orthogonal to device type: single-rank / offline hosts never build
 a ``torch.distributed.ProcessGroup`` regardless of accelerator, and calling
 ``.barrier()`` on ``None`` is what previously blocked ``Scheduler.shutdown()``
-on a TP=1 NPU deployment. These tests pin three properties:
+on a TP=1 MetaX deployment. These tests pin three properties:
 
 1. ``sync_all_ranks`` with ``tp_cpu_group=None`` does not touch a barrier.
 2. ``sync_all_ranks`` with a real-looking group calls ``barrier`` and the
    returned work object's ``wait`` exactly once each — the original TP>1
    behaviour is preserved.
-3. ``Scheduler.shutdown`` on a TP=1 NPU (group=None) still routes device
+3. ``Scheduler.shutdown`` on a TP=1 MetaX host (group=None) still routes device
    synchronize through ``minisgl.utils.device_runtime.synchronize_device`` and
    still tears down the engine — the sync_all_ranks no-op does not short-circuit
    the rest of shutdown.
@@ -26,8 +26,7 @@ from unittest.mock import MagicMock
 import pytest
 
 # Ensure ``python/`` is discoverable so ``import minisgl.*`` resolves the real
-# source tree even when this file is run standalone. Other tests in this dir
-# rely on side-effects from ``test_ascend_fia_backend.py`` for the same insert.
+# source tree even when this file is run standalone.
 _PY_ROOT = Path(__file__).resolve().parents[2] / "python"
 if str(_PY_ROOT) not in sys.path:
     sys.path.insert(0, str(_PY_ROOT))
@@ -44,6 +43,20 @@ def _purge_minisgl_from_sys_modules() -> None:
     for name in list(sys.modules):
         if name == "minisgl" or name.startswith("minisgl."):
             del sys.modules[name]
+
+
+def _stub_empty_drain_state(scheduler: Any) -> None:
+    """Give a ``__new__``-built Scheduler the minimal queue state ``shutdown()``
+    walks. ``shutdown()`` calls ``_drain_requests()`` (between the device/rank
+    sync and ``engine.shutdown()``), which reads ``prefill_manager.pending_list``
+    and ``decode_manager.running_reqs``. Empty containers make the drain a clean
+    no-op so these tests can focus on the sync → barrier → engine_shutdown
+    ordering without constructing the full allocator stack.
+    """
+    scheduler.prefill_manager = MagicMock()
+    scheduler.prefill_manager.pending_list = []
+    scheduler.decode_manager = MagicMock()
+    scheduler.decode_manager.running_reqs = set()
 
 
 def test_scheduler_io_import_does_not_require_msgpack(
@@ -117,7 +130,7 @@ def test_sync_all_ranks_calls_barrier_then_wait_when_group_present() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3. Scheduler.shutdown on a TP=1 NPU (group=None) still synchronizes the
+# 3. Scheduler.shutdown on a TP=1 MetaX host (group=None) still synchronizes the
 #    device and shuts the engine down. The sync_all_ranks no-op is transparent
 #    to the surrounding shutdown sequence.
 # ---------------------------------------------------------------------------
@@ -141,16 +154,18 @@ def test_scheduler_shutdown_with_none_group_still_runs_synchronize_and_engine_sh
     monkeypatch.setattr(sched_mod, "synchronize_device", _fake_synchronize_device)
 
     scheduler = sched_mod.Scheduler.__new__(sched_mod.Scheduler)
-    scheduler.device_type = "npu"
+    scheduler.device_type = "cuda"
     scheduler.engine = MagicMock()
-    # Real production state on a TP=1 NPU: Engine._init_communication returned
-    # None because tp_info.size == 1, so the mixin stored None into tp_cpu_group.
+    # Real production state on a TP=1 MetaX host: Engine._init_communication
+    # returned None because tp_info.size == 1, so the mixin stored None into
+    # tp_cpu_group.
     scheduler.tp_cpu_group = None  # type: ignore[attr-defined]
+    _stub_empty_drain_state(scheduler)
 
     scheduler.shutdown()
 
     # Device synchronize routed through device_runtime with the engine's dtype.
-    assert sync_calls == ["npu"], sync_calls
+    assert sync_calls == ["cuda"], sync_calls
     # Engine still torn down after the no-op barrier.
     scheduler.engine.shutdown.assert_called_once()
 
@@ -196,10 +211,11 @@ def test_scheduler_shutdown_with_real_group_still_barriers(
     engine.shutdown.side_effect = _record_engine_shutdown
 
     scheduler = sched_mod.Scheduler.__new__(sched_mod.Scheduler)
-    scheduler.device_type = "npu"
+    scheduler.device_type = "cuda"
     scheduler.engine = engine
     scheduler.tp_cpu_group = _FakeGroup()  # type: ignore[attr-defined]
+    _stub_empty_drain_state(scheduler)
 
     scheduler.shutdown()
 
-    assert order == ["sync:npu", "barrier", "wait", "engine_shutdown"], order
+    assert order == ["sync:cuda", "barrier", "wait", "engine_shutdown"], order

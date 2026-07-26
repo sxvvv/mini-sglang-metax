@@ -8,13 +8,14 @@ Structural + behavioural checks on ``minisgl.scheduler.scheduler``:
    must be sourced from ``minisgl.utils.device_runtime``.
 2. The module must import ``create_stream``, ``set_stream``, ``current_stream``,
    ``stream_context``, and ``synchronize_device`` from ``minisgl.utils.device_runtime``.
-3. ``Scheduler.__init__`` on NPU never accesses ``torch.cuda.Stream`` or
-   ``torch.cuda.set_stream`` — we booby-trap them and drive init through a stub
-   Engine to prove the NPU branch is taken.
+3. ``Scheduler.__init__`` on a non-CUDA device never accesses ``torch.cuda.Stream``
+   or ``torch.cuda.set_stream`` — we booby-trap them and drive init through a stub
+   Engine to prove the non-CUDA branch is taken.
 4. ``Scheduler.shutdown`` calls ``synchronize_device`` with the engine's
    ``device_type``, not raw ``torch.cuda.synchronize``.
 5. The CUDA branch remains structurally intact (device_runtime still dispatches
-   to ``torch.cuda.Stream`` etc. when ``device_type=="cuda"``).
+   to ``torch.cuda.Stream`` etc. when ``device_type=="cuda"``). This is the path
+   MetaX itself takes — its vendor ``torch.cuda`` surface is used directly.
 """
 from __future__ import annotations
 
@@ -60,7 +61,7 @@ _FORBIDDEN_PATTERNS = [
 
 
 def test_scheduler_source_has_no_raw_torch_cuda_stream_calls() -> None:
-    src = _SCHEDULER_PATH.read_text()
+    src = _SCHEDULER_PATH.read_text(encoding="utf-8")
     # Strip comments so prose about torch.cuda.* is not counted.
     code_only = "\n".join(line.split("#", 1)[0] for line in src.splitlines())
     for pattern in _FORBIDDEN_PATTERNS:
@@ -71,7 +72,7 @@ def test_scheduler_source_has_no_raw_torch_cuda_stream_calls() -> None:
 
 
 def test_scheduler_imports_device_runtime_helpers() -> None:
-    tree = ast.parse(_SCHEDULER_PATH.read_text())
+    tree = ast.parse(_SCHEDULER_PATH.read_text(encoding="utf-8"))
     imported: dict[str, set[str]] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module:
@@ -88,12 +89,13 @@ def test_scheduler_imports_device_runtime_helpers() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. Behavioural: Scheduler.__init__ on NPU never touches torch.cuda stream API.
+# 2. Behavioural: Scheduler.__init__ on a non-CUDA device never touches the
+#    torch.cuda stream API.
 # ---------------------------------------------------------------------------
 
 
 class _StreamCtx:
-    """Fake StreamContext returned by torch.{cuda,npu}.stream(s)."""
+    """Fake StreamContext returned by torch.cuda.stream(s)."""
 
     def __init__(self, stream: Any) -> None:
         self.stream = stream
@@ -156,7 +158,7 @@ def _make_stub_config() -> Any:
     return cfg
 
 
-def test_npu_scheduler_init_never_touches_torch_cuda_stream(
+def test_noncuda_scheduler_init_never_touches_torch_cuda_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch = pytest.importorskip("torch")
@@ -212,21 +214,21 @@ def test_npu_scheduler_init_never_touches_torch_cuda_stream(
     monkeypatch.setattr(sched_mod, "load_tokenizer", lambda _p: MagicMock(eos_token_id=0))
 
     # Build the stub engine + config.
-    _make_stub_engine(monkeypatch, device_type="npu")
+    _make_stub_engine(monkeypatch, device_type="cpu")
     cfg = _make_stub_config()
 
     scheduler = sched_mod.Scheduler(cfg)
 
     # Exactly one create_stream, one stream_context, one set_stream — all with
-    # device_type == "npu". No touch of raw torch.cuda stream API.
+    # device_type == "cpu". No touch of raw torch.cuda stream API.
     call_names = [c[0] for c in calls]
     assert call_names == ["create_stream", "stream_context", "set_stream"], call_names
     for name, dt in calls:
-        assert dt == "npu", f"{name} routed with device_type={dt} instead of npu"
-    assert scheduler.device_type == "npu"
+        assert dt == "cpu", f"{name} routed with device_type={dt} instead of cpu"
+    assert scheduler.device_type == "cpu"
 
 
-def test_npu_scheduler_shutdown_routes_through_device_runtime(
+def test_noncuda_scheduler_shutdown_routes_through_device_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch = pytest.importorskip("torch")
@@ -252,14 +254,20 @@ def test_npu_scheduler_shutdown_routes_through_device_runtime(
 
     # Build a Scheduler skeleton — bypass __init__ so we only exercise shutdown.
     scheduler = sched_mod.Scheduler.__new__(sched_mod.Scheduler)
-    scheduler.device_type = "npu"
+    scheduler.device_type = "cpu"
     scheduler.engine = MagicMock()
     # Stub sync_all_ranks so we don't need a real ProcessGroup.
     scheduler.sync_all_ranks = lambda: None  # type: ignore[method-assign]
+    # shutdown() drains pending/running queues between the device sync and the
+    # engine teardown; empty managers make that drain a clean no-op.
+    scheduler.prefill_manager = MagicMock()
+    scheduler.prefill_manager.pending_list = []
+    scheduler.decode_manager = MagicMock()
+    scheduler.decode_manager.running_reqs = set()
 
     scheduler.shutdown()
 
-    assert sync_calls == ["npu"], sync_calls
+    assert sync_calls == ["cpu"], sync_calls
     scheduler.engine.shutdown.assert_called_once()
 
 

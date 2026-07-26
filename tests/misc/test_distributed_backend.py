@@ -1,8 +1,8 @@
 """Unit tests for :mod:`minisgl.distributed.backend`.
 
-The backend selector must be a pure lookup — no torch, no ``torch_npu``, no
-process-group init, no environment reads. These tests exercise the mapping
-directly and use ``monkeypatch`` to swap the underlying device probes.
+The backend selector must be a pure lookup — no torch, no process-group init,
+no environment reads. These tests exercise the mapping directly and use
+``monkeypatch`` to swap the underlying device probes.
 
 Like :mod:`tests.misc.test_device`, the modules under test are loaded via
 ``importlib.util`` so the suite runs on macOS without the heavyweight optional
@@ -56,20 +56,37 @@ backend = _load_isolated("minisgl.distributed.backend", _BACKEND_PATH)
 @pytest.fixture(autouse=True)
 def _reset_device_cache():
     device.is_cuda_available.cache_clear()
-    device.is_npu_available.cache_clear()
     device.get_device_type.cache_clear()
     yield
     device.is_cuda_available.cache_clear()
-    device.is_npu_available.cache_clear()
     device.get_device_type.cache_clear()
+
+
+# The module-level _install_package_stub / _load_isolated calls register bare
+# stub modules into sys.modules so the relative imports inside backend.py
+# resolve without pulling in the real heavy __init__ files.  If those stubs
+# stay in sys.modules after this file is done, any later test that does
+# ``from minisgl.distributed import DistributedInfo`` (e.g. through
+# engine/config.py) will hit the bare stub and raise ImportError.  This
+# module-scoped fixture scrubs every key this file installed on teardown.
+_STUB_KEYS = [
+    "minisgl",
+    "minisgl.utils",
+    "minisgl.distributed",
+    "minisgl.utils.device",
+    "minisgl.distributed.backend",
+]
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _cleanup_module_stubs():
+    yield
+    for key in _STUB_KEYS:
+        sys.modules.pop(key, None)
 
 
 def test_explicit_cuda_maps_to_nccl() -> None:
     assert backend.get_distributed_backend("cuda") == "nccl"
-
-
-def test_explicit_npu_maps_to_hccl() -> None:
-    assert backend.get_distributed_backend("npu") == "hccl"
 
 
 def test_explicit_cpu_maps_to_gloo() -> None:
@@ -78,22 +95,13 @@ def test_explicit_cpu_maps_to_gloo() -> None:
 
 def test_none_defers_to_device_probe_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(device, "_probe_cuda", lambda: True)
-    monkeypatch.setattr(device, "_probe_npu", lambda: False)
 
     assert backend.get_distributed_backend() == "nccl"
     assert backend.get_distributed_backend(None) == "nccl"
 
 
-def test_none_defers_to_device_probe_npu(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(device, "_probe_cuda", lambda: False)
-    monkeypatch.setattr(device, "_probe_npu", lambda: True)
-
-    assert backend.get_distributed_backend() == "hccl"
-
-
 def test_none_defers_to_device_probe_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(device, "_probe_cuda", lambda: False)
-    monkeypatch.setattr(device, "_probe_npu", lambda: False)
 
     assert backend.get_distributed_backend() == "gloo"
 
@@ -110,17 +118,11 @@ def test_explicit_value_does_not_reprobe(monkeypatch: pytest.MonkeyPatch) -> Non
         calls.append("_probe_cuda")
         return True
 
-    def spy_probe_npu() -> bool:  # pragma: no cover - must not fire
-        calls.append("_probe_npu")
-        return True
-
     monkeypatch.setattr(device, "get_device_type", spy_get_device_type)
     monkeypatch.setattr(device, "_probe_cuda", spy_probe_cuda)
-    monkeypatch.setattr(device, "_probe_npu", spy_probe_npu)
     # backend.py imported the symbol at load time; patch its local binding too.
     monkeypatch.setattr(backend, "get_device_type", spy_get_device_type)
 
-    assert backend.get_distributed_backend("npu") == "hccl"
     assert backend.get_distributed_backend("cuda") == "nccl"
     assert backend.get_distributed_backend("cpu") == "gloo"
     assert calls == []
@@ -133,7 +135,7 @@ def test_invalid_device_type_raises_value_error() -> None:
     msg = str(excinfo.value)
     assert "tpu" in msg
     # Error message must be actionable — list the supported values.
-    assert "cuda" in msg and "npu" in msg and "cpu" in msg
+    assert "cuda" in msg and "cpu" in msg
 
 
 def test_invalid_device_type_from_probe_raises_value_error(

@@ -2,105 +2,75 @@
   <img width="360" src="assets/logo.png" alt="Mini-SGLang">
 </p>
 
-# Mini-SGLang MetaX
+# mini-sglang-metax
 
-`mini-sglang-metax` is a correctness-first Mini-SGLang port for MetaX
-C500/C550 accelerators and the MACA software stack. It keeps the compact
-Mini-SGLang architecture while replacing NVIDIA-only runtime assumptions with
-explicit MetaX routing and portable PyTorch fallbacks.
+A correctness-first port of Mini-SGLang to MetaX C500/C550 and the MACA
+software stack. The codebase (~5 K lines) is small enough to read end-to-end,
+which is the point — the goal is understanding the inference engine, not
+production headroom.
 
-The Python import name remains `minisgl` for compatibility with upstream code.
-The distribution and project name is `mini-sglang-metax`.
+The Python import name stays `minisgl`. The distribution name is
+`mini-sglang-metax`.
 
-For the full architecture, borrowed foundations, attribution, MetaX-owned
-adaptation boundary, and validation model, read
-[`PROVENANCE.md`](PROVENANCE.md). This project keeps upstream ideas and prior
-Ascend reference work explicitly attributed rather than presenting them as
-new MetaX inventions.
+See [`PROVENANCE.md`](PROVENANCE.md) for source lineage and attribution, and
+[`docs/metax_port/open_source_readiness.md`](docs/metax_port/open_source_readiness.md)
+for public-release scope and remaining blockers.
 
-## Current status
+## Status
 
-**Status: MetaX technical preview, real-hardware offline Gate 0 and bounded
-online Gate 1.2 paths passed.**
+**MetaX technical preview — offline Gate 0 and bounded online Gate 1.2
+passed on real hardware.**
 
-| Area | Validated result |
+| Area | Result |
 | --- | --- |
-| Hardware | MetaX C500 and C550 visible through vendor `torch.cuda` API |
+| Hardware | MetaX C500, C550 via vendor `torch.cuda` |
 | Vendor PyTorch | `2.10.0+metax3.8.1.0` |
 | Real model | Qwen3-8B BF16, TP1, eager, `torch_native` attention |
-| Repeated requests | Two deterministic greedy requests in one live `LLM` instance |
-| Cache invariant | `512/512` KV tokens available after each real-model request |
-| Multi-card transport | TP2 NCCL/MCCL-compatible all-reduce passed |
-| Framework TP coverage | Synthetic Qwen3 TP2 and TP8 end-to-end passed |
-| Online server | TP1 Gate 1.2: 24/24 bounded requests, overload queueing, fault recovery, actual scheduler batching, and cleanup passed on C550 |
-| Vendor attention | MetaX `flashinfer` TP1 Gate 1 passed after signature compatibility fixes; explicit opt-in only |
+| Repeated requests | Two deterministic greedy runs in one `LLM` instance |
+| KV cache invariant | `512/512` available after each real-model request |
+| Multi-card transport | TP2 MCCL all-reduce |
+| Framework TP | Synthetic Qwen3 TP2/TP8 end-to-end |
+| Online — Gate 1.2 | 24/24 bounded requests, overload queueing, fault recovery, scheduler batching on C550 |
+| Vendor attention | MetaX `flashinfer` TP1 Gate 1 (signature-fixed; explicit opt-in only) |
 
-Real-model evidence is recorded in
-[`docs/metax_port/gate0_verdict.md`](docs/metax_port/gate0_verdict.md). Online
-evidence is recorded in
-[`docs/metax_port/online_gate1_verdict.md`](docs/metax_port/online_gate1_verdict.md)
-and
-[`docs/metax_port/online_gate1_1_verdict.md`](docs/metax_port/online_gate1_1_verdict.md),
-with Gate 1.2 evidence in
+Evidence: [`docs/metax_port/gate0_verdict.md`](docs/metax_port/gate0_verdict.md),
+[`docs/metax_port/online_gate1_verdict.md`](docs/metax_port/online_gate1_verdict.md),
 [`docs/metax_port/online_gate1_2_verdict.md`](docs/metax_port/online_gate1_2_verdict.md).
-Public-release scope and remaining blockers are summarized in
-[`docs/metax_port/open_source_readiness.md`](docs/metax_port/open_source_readiness.md).
 
-## Why a MetaX-specific project
+## The core design decision
 
-MetaX vendor PyTorch exposes devices through `torch.cuda`, but that does not
-make every NVIDIA binary or kernel API compatible. Upstream Mini-SGLang assumes
-FlashInfer, `sgl_kernel`, CUDA Graph, PyNCCL, and NVIDIA architecture probes in
-several hot paths.
+MetaX vendor PyTorch surfaces devices through `torch.cuda`. That makes
+the device API identical to NVIDIA, but it does not mean every NVIDIA binary
+runs — FlashInfer, `sgl_kernel`, CUDA Graph, and PyNCCL all depend on compiled
+SM-architecture extensions that do not exist in the MACA stack.
 
-The three accelerator routes in this repository are intentionally distinct:
+The project separates two things that the upstream code treats as one:
 
-| Route | PyTorch device surface | Vendor software/collectives | Project routing contract |
-| --- | --- | --- | --- |
-| NVIDIA | `torch.cuda` | CUDA and NCCL | `platform=nvidia`; upstream NVIDIA-oriented fused backends may be selected when installed |
-| Huawei Ascend | `torch.npu` after `torch_npu` import | CANN and HCCL | `platform=ascend`; NPU runtime dispatch and the explicit `npu_fia` backend are separate compatibility paths |
-| MetaX | vendor `torch.cuda` compatibility surface | MACA and MCCL | `platform=metax`; eager `torch_native` is the default, with the installed MetaX `flashinfer` package available only by explicit opt-in |
+```
+device_type = "cuda"   # the PyTorch API surface (torch.cuda.*, streams, events)
+platform    = "metax"  # the hardware vendor, used for kernel and backend routing
+```
 
-This table describes framework routing, not binary compatibility or a
-performance comparison. MetaX is not treated as an NVIDIA device merely
-because its PyTorch API is CUDA-facing, and the Ascend `torch_npu`/HCCL/FIA
-implementation is not reused as the MetaX backend.
+`device_type` drives everything that goes through `torch.cuda.*` directly:
+stream creation, event recording, memory queries, and distributed backend
+selection. `platform` drives which implementation runs at each operator site.
+On NVIDIA both agree. On MetaX they disagree on purpose: `device_type` stays
+`"cuda"` so the whole PyTorch device plumbing keeps working; `platform` flips
+to `"metax"` so the code routes around compiled NVIDIA extensions.
 
-This project separates two concepts:
+`get_accelerator_platform()` in `python/minisgl/utils/platform.py` resolves
+the platform at startup — it checks `MACA_PATH`, MACA markers in `CUDA_HOME` /
+`CUDA_PATH`, and `"metax"` / `"maca"` substrings in `torch.__version__`. Set
+`MINISGL_PLATFORM=metax` to override.
 
-- **Device API:** `cuda`, because MACA vendor PyTorch intentionally preserves
-  the CUDA-facing PyTorch contract.
-- **Accelerator platform:** `metax`, detected independently so the framework
-  can avoid NVIDIA-only kernel and graph choices.
+**What this enables on MetaX today:**
 
-The current bring-up path uses:
-
-- eager execution;
-- BF16 dense Qwen models;
-- portable `torch_native` attention;
-- an explicit, experimental MetaX `flashinfer` attention option while
-  `torch_native` remains the default correctness path;
-- PyTorch implementations for activation, norm, RoPE, embedding, and greedy
-  sampling where the upstream fused path is NVIDIA-specific;
-- vendor `torch.distributed` collectives for TP2/TP8;
-- CUDA Graph and PyNCCL disabled until separately validated.
-
-The MetaX-specific engineering work is therefore concrete rather than a
-rename:
-
-1. Detect the accelerator vendor independently from `tensor.device.type`, so
-   CUDA-facing MetaX tensors select `platform=metax` instead of NVIDIA kernels.
-2. Route activation, normalization, rotary embedding, embedding, attention,
-   and sampling around NVIDIA-only fused operators when running on MetaX.
-3. Keep a readable eager PyTorch correctness path while preserving the vendor
-   PyTorch installation and its device/allocator behavior.
-4. Use the vendor `torch.distributed` compatibility layer for validated
-   collectives instead of assuming the upstream PyNCCL wrapper is portable.
-5. Adapt optional MetaX `flashinfer` wrapper calls to the signatures actually
-   installed on the target, without making that experimental backend default.
-6. Validate the result with real Qwen3-8B requests, KV-cache recovery, HTTP/SSE
-   cancellation, scheduler batching, bounded overload, and failure recovery on
-   C500/C550 hardware.
+- Eager execution with `torch_native` attention (no compiled attention kernel)
+- KV cache scatter via `index_copy_` (no fused `store_cache` CUDA kernel)
+- Pure-PyTorch NeoX RoPE with fp32 mid-calculation
+- TP1 deployment with zero `torch.distributed` bootstrap (no gloo sidecar)
+- TP2/TP8 via vendor `torch.distributed` / MCCL
+- BF16 dense Qwen models (MoE not yet supported)
 
 ## Quick start on MetaX
 
@@ -292,19 +262,41 @@ Not yet claimed:
 
 ## Verification
 
-Focused host-independent checks:
+Any CPU host works for the portable tests — no GPU needed.
 
 ```bash
-pytest -q -o addopts="" tests/misc/test_platform.py
-pytest -q -o addopts="" tests/misc/test_torch_native_attention.py
-pytest -q -o addopts="" tests/misc/test_pyproject_config.py
-pytest -q -o addopts="" \
-  tests/misc/test_scheduler_sync_all_ranks.py \
-  -k scheduler_io_import_does_not_require_msgpack
+python -m venv .venv && source .venv/bin/activate
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install pytest msgpack pyzmq fastapi uvicorn prompt_toolkit \
+  "transformers>=4.56.0,<=4.57.3"
+pip install -e . --no-deps
 ```
 
-Real hardware verification must use the scripts under `scripts/metax/` and
-must preserve the vendor runtime.
+CI suite (~20 s):
+
+```bash
+python -m pytest -q -o addopts="" \
+  tests/misc/test_platform.py \
+  tests/misc/test_torch_native_attention.py \
+  tests/misc/test_pyproject_config.py \
+  tests/misc/test_metax_vendor_inventory.py \
+  tests/misc/test_metax_flashinfer_compat.py \
+  tests/misc/test_metax_online_gate_client.py \
+  tests/misc/test_metax_online_gate1_2_client.py \
+  tests/misc/test_metax_batch_observability.py \
+  tests/misc/test_scheduler_batch_observability.py \
+  tests/misc/test_scheduler_abort_ack.py \
+  tests/misc/test_exposed_path_abort_ack.py
+```
+
+Broader control-plane and layer suite:
+
+```bash
+python -m pytest -q -o addopts="" tests/misc/ tests/layers/
+```
+
+Real-hardware validation uses `scripts/metax/` — preserve the vendor PyTorch
+installation.
 
 ## Contributing and security
 
@@ -315,12 +307,6 @@ model artifacts to a public issue.
 
 ## Attribution and license
 
-This project is derived from
-[`sgl-project/mini-sglang`](https://github.com/sgl-project/mini-sglang) and
-retains its MIT license. The earlier Ascend adaptation was used as a device
-abstraction and validation reference; its historical evidence remains under
-`docs/ascend_port/` but is not the current product surface and must not be read
-as MetaX compatibility evidence.
-
-MetaX, MACA, MCCL, and vendor PyTorch are external platform dependencies and
-are not implemented or redistributed by this repository.
+Derived from
+[`sgl-project/mini-sglang`](https://github.com/sgl-project/mini-sglang),
+MIT license retained.

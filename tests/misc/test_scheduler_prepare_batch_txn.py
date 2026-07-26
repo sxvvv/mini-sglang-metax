@@ -253,7 +253,7 @@ def test_B_with_prefix_rollback_preserves_prefix_pages(cm_env):
     ]
 
     def _explode(batch):
-        raise NotImplementedError("gate23b_B: mimicking Ascend FIA refusal")
+        raise NotImplementedError("gate23b_B: mimicking prepare-metadata refusal")
 
     sched = _build_scheduler_skeleton(env, prepare_metadata=_explode)
     batch = _new_prefill_batch(reqs)

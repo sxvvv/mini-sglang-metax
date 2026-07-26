@@ -4,7 +4,7 @@ from typing import Literal
 
 from ..utils.device import DeviceType, get_device_type
 
-DistributedBackend = Literal["nccl", "hccl", "gloo"]
+DistributedBackend = Literal["nccl", "gloo"]
 
 __all__ = ["DistributedBackend", "get_distributed_backend"]
 
@@ -14,7 +14,6 @@ __all__ = ["DistributedBackend", "get_distributed_backend"]
 # only public contract is ``get_distributed_backend``.
 _DEVICE_TO_BACKEND: dict[str, DistributedBackend] = {
     "cuda": "nccl",
-    "npu": "hccl",
     "cpu": "gloo",
 }
 
@@ -25,21 +24,22 @@ def get_distributed_backend(device_type: DeviceType | None = None) -> Distribute
     Mapping::
 
         cuda -> nccl
-        npu  -> hccl
         cpu  -> gloo
+
+    On MetaX the ``cuda`` device selects the ``nccl`` backend, which the vendor
+    ``torch.distributed`` implements against the MACA/MCCL stack.
 
     When ``device_type`` is ``None`` the function defers to
     :func:`minisgl.utils.device.get_device_type` (which itself is cached and
     side-effect free). When an explicit value is supplied the device layer is
     **not** re-probed — the caller's choice is honored verbatim.
 
-    This helper is a pure lookup: it does not import ``torch_npu``, does not
-    call ``torch.distributed.init_process_group``, does not touch any device
-    or environment variable, and does not read rank/world-size state.
+    This helper is a pure lookup: it does not call
+    ``torch.distributed.init_process_group``, does not touch any device or
+    environment variable, and does not read rank/world-size state.
 
     Raises:
-        ValueError: if ``device_type`` is not one of ``"cuda"``, ``"npu"``,
-            ``"cpu"``.
+        ValueError: if ``device_type`` is not one of ``"cuda"``, ``"cpu"``.
     """
     resolved = device_type if device_type is not None else get_device_type()
     try:

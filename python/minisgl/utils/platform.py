@@ -6,10 +6,10 @@ from typing import Literal
 
 from .device import DeviceType, get_device_type
 
-AcceleratorPlatform = Literal["nvidia", "metax", "ascend", "cpu"]
+AcceleratorPlatform = Literal["nvidia", "metax", "cpu"]
 
 _PLATFORM_ENV = "MINISGL_PLATFORM"
-_SUPPORTED_PLATFORMS = {"nvidia", "metax", "ascend", "cpu"}
+_SUPPORTED_PLATFORMS = {"nvidia", "metax", "cpu"}
 
 
 def _probe_metax() -> bool:
@@ -58,8 +58,6 @@ def get_accelerator_platform(
         return override  # type: ignore[return-value]
 
     resolved = device_type if device_type is not None else get_device_type()
-    if resolved == "npu":
-        return "ascend"
     if resolved == "cpu":
         return "cpu"
     return "metax" if _probe_metax() else "nvidia"

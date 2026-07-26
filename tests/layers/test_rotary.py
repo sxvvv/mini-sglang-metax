@@ -1,8 +1,8 @@
 """Hermetic tests for ``python/minisgl/layers/rotary.py`` device dispatch.
 
-The tests never touch CUDA or NPU hardware. Fake ``flashinfer`` and
-``torch_npu`` modules are injected via ``monkeypatch`` and a fake tensor
-wrapper carries a controlled ``device.type`` string through the dispatch
+The tests never touch CUDA hardware. A fake ``flashinfer`` module is
+injected via ``monkeypatch`` and a fake tensor wrapper carries a controlled
+``device.type`` string through the dispatch
 while forwarding ``.dtype`` / ``.shape`` / ``.view`` to a real underlying
 tensor.
 """
@@ -54,88 +54,6 @@ def block_flashinfer(monkeypatch):
             monkeypatch.delitem(sys.modules, name, raising=False)
     finder = _BlockingFinder("flashinfer")
     monkeypatch.setattr(sys, "meta_path", [finder] + list(sys.meta_path))
-
-
-@pytest.fixture
-def block_torch_npu(monkeypatch):
-    for name in list(sys.modules):
-        if name.split(".", 1)[0] == "torch_npu":
-            monkeypatch.delitem(sys.modules, name, raising=False)
-    finder = _BlockingFinder("torch_npu")
-    monkeypatch.setattr(sys, "meta_path", [finder] + list(sys.meta_path))
-
-
-# ---------- npu device shim (hermetic, no torch_npu required) --------------
-#
-# ``torch.device('npu[...]')`` string parsing fails on hosts without
-# ``torch_npu`` — the parser doesn't know the ``npu`` type name. Tests that
-# only need to *reason about* an ``npu`` device (cache-key isolation,
-# accelerator-index rejection, etc.) shouldn't require torch_npu wheels.
-#
-# This fixture intercepts ``torch.device('npu', ...)`` / ``torch.device('npu:i')``
-# with a lightweight stand-in that mimics the surface ``_normalize_device``
-# consumes: ``.type``, ``.index``, equality, and hashability. All other
-# ``torch.device(...)`` inputs (cpu, meta, cuda:i) fall through to the real
-# parser.
-
-
-class _NpuDeviceStub:
-    __slots__ = ("type", "index")
-
-    def __init__(self, index):
-        self.type = "npu"
-        self.index = index
-
-    def __repr__(self):
-        if self.index is None:
-            return "device(type='npu')"
-        return f"device(type='npu', index={self.index})"
-
-    def __eq__(self, other):
-        return (
-            isinstance(other, _NpuDeviceStub)
-            and self.type == other.type
-            and self.index == other.index
-        )
-
-    def __hash__(self):
-        return hash((self.type, self.index))
-
-
-@pytest.fixture
-def npu_device_shim(monkeypatch):
-    """Return a ``make(type, index=None)`` builder that produces a stand-in
-    ``torch.device('npu[:i]')`` while patching ``torch.device`` so
-    ``_normalize_device``'s own ``torch.device(device)`` re-wrap step accepts
-    the stub. Non-npu calls fall through to the real constructor unchanged.
-    """
-    real_torch_device = torch.device
-
-    def fake_device(*args, **kwargs):
-        # torch.device(stub) → identity for our stub
-        if len(args) == 1 and isinstance(args[0], _NpuDeviceStub):
-            return args[0]
-        # torch.device("npu", idx)
-        if len(args) >= 1 and args[0] == "npu":
-            idx = args[1] if len(args) > 1 else kwargs.get("index")
-            return _NpuDeviceStub(idx)
-        # torch.device("npu:i") string form
-        if len(args) == 1 and isinstance(args[0], str) and args[0].startswith("npu"):
-            s = args[0]
-            if s == "npu":
-                return _NpuDeviceStub(None)
-            if ":" in s:
-                _, idx_s = s.split(":", 1)
-                return _NpuDeviceStub(int(idx_s))
-        return real_torch_device(*args, **kwargs)
-
-    monkeypatch.setattr(torch, "device", fake_device)
-
-    def make(_type, index=None):
-        assert _type == "npu", "npu_device_shim only synthesises 'npu' devices"
-        return _NpuDeviceStub(index)
-
-    return make
 
 
 # ============================================================ helpers
@@ -274,13 +192,6 @@ def _install_fake_flashinfer(monkeypatch, apply_rope=None):
     if apply_rope is not None:
         fake.apply_rope_with_cos_sin_cache_inplace = apply_rope
     monkeypatch.setitem(sys.modules, "flashinfer", fake)
-
-
-def _install_fake_torch_npu(monkeypatch, rotary_mul=None):
-    fake = types.ModuleType("torch_npu")
-    if rotary_mul is not None:
-        fake.npu_rotary_mul = rotary_mul
-    monkeypatch.setitem(sys.modules, "torch_npu", fake)
 
 
 # ================================================================ #1
@@ -445,131 +356,6 @@ def test_cpu_forward_supports_different_hq_hk_head_counts(fresh_rotary):
     assert torch.allclose(k_out, k_ref, atol=1e-6)
 
 
-# ================================================================ #9
-def test_npu_forward_reshapes_qk_to_4d_bsnd(fresh_rotary, monkeypatch):
-    call_log = []
-
-    def fake_rotary_mul(x, r1, r2, rotary_mode):
-        call_log.append({"x_shape": tuple(x.shape), "r1_shape": tuple(r1.shape),
-                         "r2_shape": tuple(r2.shape), "rotary_mode": rotary_mode})
-        return torch.zeros_like(x)
-
-    _install_fake_torch_npu(monkeypatch, rotary_mul=fake_rotary_mul)
-
-    rope = fresh_rotary.RotaryEmbedding(128, 128, 32, 10000.0)
-    T, Hq, Hk, D = 5, 4, 2, 128
-    positions = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64)
-    fake_q = _FakeTensor(torch.randn(T, Hq, D, dtype=torch.float16), "npu")
-    fake_k = _FakeTensor(torch.randn(T, Hk, D, dtype=torch.float16), "npu")
-
-    _ = rope.forward(positions, fake_q, fake_k)
-
-    assert len(call_log) == 2
-    # Query call
-    assert call_log[0]["x_shape"] == (1, T, Hq, D)
-    # Key call
-    assert call_log[1]["x_shape"] == (1, T, Hk, D)
-
-
-# ================================================================ #10
-def test_npu_forward_cos_sin_shape_is_1_T_1_D_neox_split(fresh_rotary, monkeypatch):
-    captured = []
-
-    def fake_rotary_mul(x, r1, r2, rotary_mode):
-        captured.append({"r1": r1.clone(), "r2": r2.clone()})
-        return torch.zeros_like(x)
-
-    _install_fake_torch_npu(monkeypatch, rotary_mul=fake_rotary_mul)
-
-    rope = fresh_rotary.RotaryEmbedding(128, 128, 32, 10000.0)
-    T, Hq, Hk, D = 3, 2, 1, 128
-    positions = torch.tensor([1, 2, 5], dtype=torch.int64)
-    fake_q = _FakeTensor(torch.randn(T, Hq, D, dtype=torch.float16), "npu")
-    fake_k = _FakeTensor(torch.randn(T, Hk, D, dtype=torch.float16), "npu")
-
-    _ = rope.forward(positions, fake_q, fake_k)
-
-    assert len(captured) == 2
-    for entry in captured:
-        assert entry["r1"].shape == (1, T, 1, D)
-        assert entry["r2"].shape == (1, T, 1, D)
-        assert entry["r1"].dtype == torch.float16
-        assert entry["r2"].dtype == torch.float16
-
-    # NeoX split correctness: cos_full == cat(cos_half, cos_half); the two
-    # halves of the last dim must be equal to each other.
-    r1 = captured[0]["r1"]
-    half = D // 2
-    assert torch.equal(r1[..., :half], r1[..., half:])
-    r2 = captured[0]["r2"]
-    assert torch.equal(r2[..., :half], r2[..., half:])
-
-    # And the halves must match what the shared cache actually stores.
-    selected = rope._cos_sin_cache[positions.long()]        # (T, D) fp32
-    cos_half_ref = selected[..., :half].to(torch.float16)   # (T, half)
-    sin_half_ref = selected[..., half:].to(torch.float16)
-    # r1 has shape (1, T, 1, D) — squeeze to (T, D) then take first half.
-    assert torch.equal(r1.view(T, D)[..., :half], cos_half_ref)
-    assert torch.equal(r2.view(T, D)[..., :half], sin_half_ref)
-
-
-# ================================================================ #11
-def test_npu_forward_calls_npu_rotary_mul_twice_with_rotary_mode_half(fresh_rotary, monkeypatch):
-    call_log = []
-
-    def fake_rotary_mul(x, r1, r2, rotary_mode):
-        call_log.append(rotary_mode)
-        return torch.zeros_like(x)
-
-    _install_fake_torch_npu(monkeypatch, rotary_mul=fake_rotary_mul)
-
-    rope = fresh_rotary.RotaryEmbedding(128, 128, 32, 10000.0)
-    T, Hq, Hk, D = 4, 3, 3, 128
-    positions = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
-    fake_q = _FakeTensor(torch.randn(T, Hq, D, dtype=torch.float16), "npu")
-    fake_k = _FakeTensor(torch.randn(T, Hk, D, dtype=torch.float16), "npu")
-
-    _ = rope.forward(positions, fake_q, fake_k)
-
-    assert call_log == ["half", "half"]
-
-
-# ================================================================ #12
-def test_npu_forward_returns_new_tensors_no_copy_no_contiguous(fresh_rotary, monkeypatch):
-    sentinel_q_4d = torch.randn(1, 4, 3, 128, dtype=torch.float16)
-    sentinel_k_4d = torch.randn(1, 4, 1, 128, dtype=torch.float16)
-    seen = []
-
-    def fake_rotary_mul(x, r1, r2, rotary_mode):
-        seen.append(tuple(x.shape))
-        if x.shape[2] == 3:
-            return sentinel_q_4d
-        return sentinel_k_4d
-
-    _install_fake_torch_npu(monkeypatch, rotary_mul=fake_rotary_mul)
-
-    rope = fresh_rotary.RotaryEmbedding(128, 128, 32, 10000.0)
-    T, Hq, Hk, D = 4, 3, 1, 128
-    positions = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
-    real_q = torch.randn(T, Hq, D, dtype=torch.float16)
-    real_k = torch.randn(T, Hk, D, dtype=torch.float16)
-    q_orig = real_q.clone()
-    k_orig = real_k.clone()
-    fake_q = _FakeTensor(real_q, "npu")
-    fake_k = _FakeTensor(real_k, "npu")
-
-    q_out, k_out = rope.forward(positions, fake_q, fake_k)
-
-    # Inputs never mutated (no copy_).
-    assert torch.equal(real_q, q_orig)
-    assert torch.equal(real_k, k_orig)
-    # Returned tensors are derived from the sentinels (no clone / contiguous
-    # inserted — .squeeze(0) is a view, so data_ptr matches the sentinels).
-    assert q_out.data_ptr() == sentinel_q_4d.data_ptr()
-    assert k_out.data_ptr() == sentinel_k_4d.data_ptr()
-    assert q_out.shape == (T, Hq, D)
-    assert k_out.shape == (T, Hk, D)
-
 
 # ================================================================ #13
 def test_cuda_forward_delegates_to_flashinfer_inplace_returns_identity(
@@ -607,8 +393,8 @@ def test_cuda_forward_delegates_to_flashinfer_inplace_returns_identity(
 
 
 # ================================================================ #14
-def test_missing_optional_deps_raise_runtime_error(
-    fresh_rotary, block_flashinfer, block_torch_npu,
+def test_missing_flashinfer_raises_runtime_error(
+    fresh_rotary, block_flashinfer,
 ):
     rope = fresh_rotary.RotaryEmbedding(128, 128, 32, 10000.0)
     positions = torch.tensor([0, 1], dtype=torch.int64)
@@ -617,11 +403,6 @@ def test_missing_optional_deps_raise_runtime_error(
     fake_k_cuda = _FakeTensor(torch.randn(2, 1, 128), "cuda")
     with pytest.raises(RuntimeError, match="flashinfer"):
         rope.forward(positions, fake_q_cuda, fake_k_cuda)
-
-    fake_q_npu = _FakeTensor(torch.randn(2, 2, 128, dtype=torch.float16), "npu")
-    fake_k_npu = _FakeTensor(torch.randn(2, 1, 128, dtype=torch.float16), "npu")
-    with pytest.raises(RuntimeError, match="torch_npu"):
-        rope.forward(positions, fake_q_npu, fake_k_npu)
 
 
 # ================================================================ #15
@@ -660,9 +441,9 @@ def test_rotary_source_never_coerces_positions_dtype(fresh_rotary):
 # resolves a target device from setter / ambient) and the private
 # ``_get_rope_cached`` (which is keyed on (params, device)).
 #
-# We deliberately never enter ``with torch.device('npu:0'):`` from these
-# tests: on CI hosts without ``torch_npu`` that would raise from PyTorch's
-# device dispatch. Instead we monkeypatch ``rotary._build_rope`` — the
+# We deliberately never enter a real accelerator device context from these
+# tests (that would need vendor runtime/allocation unavailable on CI).
+# Instead we monkeypatch ``rotary._build_rope`` — the
 # private constructor shim that owns the device context — with a stub that
 # returns a fresh sentinel per call and records what it was asked to build.
 # The cache-key logic under test lives entirely in ``_get_rope_cached`` and
@@ -765,44 +546,12 @@ def test_normalize_device_preserves_distinct_indices_cuda(fresh_rotary):
     assert b.type == "cuda" and b.index == 1
 
 
-def test_normalize_device_preserves_distinct_indices_npu(fresh_rotary, npu_device_shim):
-    """``npu:0`` and ``npu:1`` must stay distinct after normalisation.
-
-    ``torch.device('npu[...]')`` string parsing fails on CI hosts without
-    ``torch_npu`` — the ``npu_device_shim`` fixture intercepts just those
-    calls with a hermetic stand-in.
-    """
-    make = npu_device_shim
-    a = fresh_rotary._normalize_device(make("npu", 0))
-    b = fresh_rotary._normalize_device(make("npu", 1))
-    assert a != b
-    assert a.type == "npu" and a.index == 0
-    assert b.type == "npu" and b.index == 1
-
 
 def test_normalize_device_rejects_cuda_without_index(fresh_rotary):
     """Bare ``torch.device('cuda')`` must be rejected (was: silent → cuda:0)."""
     with pytest.raises(ValueError, match="explicit index"):
         fresh_rotary._normalize_device(torch.device("cuda"))
 
-
-def test_normalize_device_rejects_npu_without_index(fresh_rotary, npu_device_shim):
-    """Bare ``torch.device('npu')`` must be rejected (was: silent → npu:0)."""
-    make = npu_device_shim
-    with pytest.raises(ValueError, match="explicit index"):
-        fresh_rotary._normalize_device(make("npu"))
-
-
-def test_engine_style_explicit_index_setter_normalises_cleanly(fresh_rotary, npu_device_shim):
-    """The production Engine passes ``torch.device('npu:{rank}')`` — this must
-    round-trip through ``_normalize_device`` without raising and preserve
-    both type and index.
-    """
-    make = npu_device_shim
-    r0 = fresh_rotary._normalize_device(make("npu", 0))
-    assert r0.type == "npu" and r0.index == 0
-    r3 = fresh_rotary._normalize_device(make("npu", 3))
-    assert r3.type == "npu" and r3.index == 3
 
 
 # --- cache key & identity -------------------------------------------------

@@ -11,7 +11,8 @@ Use Python 3.10 or newer. On a normal CPU development host:
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e . --no-deps
-python -m pip install pytest msgpack pyzmq fastapi uvicorn prompt_toolkit
+python -m pip install pytest msgpack pyzmq fastapi uvicorn prompt_toolkit \
+  "transformers>=4.56.0,<=4.57.3"
 ```
 
 Install a CPU PyTorch wheel for host-independent tests. On MetaX hardware,

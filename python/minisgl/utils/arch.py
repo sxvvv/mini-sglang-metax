@@ -11,7 +11,7 @@ def _get_torch_cuda_version() -> Tuple[int, int] | None:
     """Return the current CUDA compute capability, or ``None`` on non-CUDA hosts.
 
     Device presence is decided by :func:`minisgl.utils.device.is_cuda_available`
-    so this module contains no direct device-probe logic. On NPU/CPU hosts the
+    so this module contains no direct device-probe logic. On CPU-only hosts the
     function returns ``None`` without importing torch's CUDA APIs.
     """
     if not is_cuda_available():

@@ -3,7 +3,7 @@
 Public names are re-exported lazily via PEP 562 ``__getattr__`` so that
 submodules like :mod:`minisgl.utils.device` can be imported on hosts that
 do not have the full runtime stack (torch, huggingface_hub, msgpack/zmq,
-...). This is the pattern required by the Ascend Gate 0.3a contract:
+...). This lazy-import discipline keeps utilities importable in a minimal env:
 
     import minisgl.utils.device          # never pulls in huggingface_hub
     import minisgl.distributed.backend    # never pulls in torch.distributed

@@ -1,20 +1,26 @@
-"""Gate 1.11a — NPU + TP=1 must skip the torch.distributed bootstrap.
+"""Gate 1.11a — MetaX + TP=1 must skip the torch.distributed bootstrap.
 
 Structural (AST-only) checks. Rationale:
 
 * Constructing an ``Engine`` for real would import the whole model stack, wire
-  up cuda/npu runtimes, and probably crash on hosts without an accelerator.
+  up the cuda runtime, and probably crash on hosts without an accelerator.
   The existing ``test_engine_device.py`` file already established a pure-AST
   test pattern for the same module, so this file follows the same shape.
 
 * The change is purely a control-flow guard, so a structural check is
   sufficient — no runtime side-effects to validate here beyond what the
-  hardware smoke on the 910B1 container exercises.
+  hardware smoke on a real C550 exercises.
+
+Note the platform/device_type split this test pins down: MetaX's vendor torch
+exposes its accelerator through ``torch.cuda`` (so ``device_type == "cuda"``),
+yet kernel/collective routing keys off ``self.platform == "metax"``. The
+no-dist fast path therefore guards on ``platform``, *not* ``device_type`` — a
+plain NVIDIA CUDA box (``platform == "nvidia"``) must still bootstrap gloo.
 
 Invariants asserted:
 
 1. ``Engine._init_communication`` opens with an ``if`` block matching
-   ``self.device_type == "npu" and config.tp_info.size == 1`` and that block
+   ``self.platform == "metax" and config.tp_info.size == 1`` and that block
    ``return``s early (``None``) before touching torch.distributed.
 2. The early-return branch does **not** call ``init_process_group``,
    ``enable_pynccl_distributed``, ``get_distributed_backend``, or ``new_group``
@@ -40,7 +46,7 @@ _ENGINE_PATH = _REPO_ROOT / "python" / "minisgl" / "engine" / "engine.py"
 
 
 def _engine_tree() -> ast.Module:
-    return ast.parse(_ENGINE_PATH.read_text())
+    return ast.parse(_ENGINE_PATH.read_text(encoding="utf-8"))
 
 
 def _engine_method(name: str) -> ast.FunctionDef:
@@ -55,7 +61,7 @@ def _engine_method(name: str) -> ast.FunctionDef:
 
 
 # ---------------------------------------------------------------------------
-# _init_communication: NPU + TP=1 no-op branch
+# _init_communication: MetaX + TP=1 no-op branch
 # ---------------------------------------------------------------------------
 
 
@@ -63,8 +69,8 @@ def _init_comm() -> ast.FunctionDef:
     return _engine_method("_init_communication")
 
 
-def _is_self_device_type_eq_npu(node: ast.AST) -> bool:
-    """Match ``self.device_type == "npu"``."""
+def _is_self_platform_eq_metax(node: ast.AST) -> bool:
+    """Match ``self.platform == "metax"``."""
     if not isinstance(node, ast.Compare):
         return False
     if len(node.ops) != 1 or not isinstance(node.ops[0], ast.Eq):
@@ -72,13 +78,13 @@ def _is_self_device_type_eq_npu(node: ast.AST) -> bool:
     left = node.left
     if not (
         isinstance(left, ast.Attribute)
-        and left.attr == "device_type"
+        and left.attr == "platform"
         and isinstance(left.value, ast.Name)
         and left.value.id == "self"
     ):
         return False
     right = node.comparators[0]
-    return isinstance(right, ast.Constant) and right.value == "npu"
+    return isinstance(right, ast.Constant) and right.value == "metax"
 
 
 def _is_config_tp_size_eq_1(node: ast.AST) -> bool:
@@ -101,42 +107,42 @@ def _is_config_tp_size_eq_1(node: ast.AST) -> bool:
     return isinstance(right, ast.Constant) and right.value == 1
 
 
-def _find_npu_tp1_guard(fn: ast.FunctionDef) -> ast.If:
-    """Locate the ``if self.device_type == "npu" and config.tp_info.size == 1`` block."""
+def _find_metax_tp1_guard(fn: ast.FunctionDef) -> ast.If:
+    """Locate the ``if self.platform == "metax" and config.tp_info.size == 1`` block."""
     for stmt in fn.body:
         if isinstance(stmt, ast.If) and isinstance(stmt.test, ast.BoolOp) and isinstance(
             stmt.test.op, ast.And
         ):
             values = stmt.test.values
             if len(values) == 2 and (
-                (_is_self_device_type_eq_npu(values[0]) and _is_config_tp_size_eq_1(values[1]))
-                or (_is_self_device_type_eq_npu(values[1]) and _is_config_tp_size_eq_1(values[0]))
+                (_is_self_platform_eq_metax(values[0]) and _is_config_tp_size_eq_1(values[1]))
+                or (_is_self_platform_eq_metax(values[1]) and _is_config_tp_size_eq_1(values[0]))
             ):
                 return stmt
     raise AssertionError(
         "Engine._init_communication must open with an "
-        "`if self.device_type == 'npu' and config.tp_info.size == 1:` guard"
+        "`if self.platform == 'metax' and config.tp_info.size == 1:` guard"
     )
 
 
-def test_init_communication_has_npu_tp1_early_return_none() -> None:
-    """The NPU+TP=1 guard must be the first non-trivial statement and return None."""
+def test_init_communication_has_metax_tp1_early_return_none() -> None:
+    """The MetaX+TP=1 guard must be the first non-trivial statement and return None."""
     fn = _init_comm()
-    guard = _find_npu_tp1_guard(fn)
+    guard = _find_metax_tp1_guard(fn)
     # Body must be exactly `return None` (or bare `return`).
     assert len(guard.body) == 1, (
-        "NPU+TP=1 guard body must be a single `return` statement"
+        "MetaX+TP=1 guard body must be a single `return` statement"
     )
     ret = guard.body[0]
-    assert isinstance(ret, ast.Return), "NPU+TP=1 guard must `return`"
+    assert isinstance(ret, ast.Return), "MetaX+TP=1 guard must `return`"
     # `return None` and bare `return` both acceptable — both signal no group.
     if ret.value is not None:
         assert isinstance(ret.value, ast.Constant) and ret.value.value is None, (
-            "NPU+TP=1 guard must return None (no tp_cpu_group)"
+            "MetaX+TP=1 guard must return None (no tp_cpu_group)"
         )
     # Guard must have no `else` — the CUDA path stays in the outer body.
     assert guard.orelse == [], (
-        "NPU+TP=1 guard must not use an `else` branch — the CUDA/HCCL paths "
+        "MetaX+TP=1 guard must not use an `else` branch — the CUDA paths "
         "fall through to the outer function body"
     )
 
@@ -177,9 +183,9 @@ def _is_new_group(call: ast.Call) -> bool:
     )
 
 
-def test_npu_tp1_guard_body_has_no_distributed_side_effects() -> None:
+def test_metax_tp1_guard_body_has_no_distributed_side_effects() -> None:
     """The early-return branch must not call any dist init helper."""
-    guard = _find_npu_tp1_guard(_init_comm())
+    guard = _find_metax_tp1_guard(_init_comm())
     for matcher, label in [
         (_is_init_process_group, "torch.distributed.init_process_group"),
         (_is_enable_pynccl, "enable_pynccl_distributed"),
@@ -187,7 +193,7 @@ def test_npu_tp1_guard_body_has_no_distributed_side_effects() -> None:
         (_is_new_group, "torch.distributed.new_group"),
     ]:
         assert not _has_call(guard, matcher), (
-            f"NPU+TP=1 no-op guard must not call {label}"
+            f"MetaX+TP=1 no-op guard must not call {label}"
         )
 
 
@@ -209,8 +215,8 @@ def test_init_communication_still_preserves_cuda_pynccl_branch() -> None:
         assert "backend" in kw, "init_process_group must specify backend explicitly"
 
 
-def test_init_communication_still_uses_get_distributed_backend_for_hccl_path() -> None:
-    """NPU TP>1 (and CUDA TP>1 non-pynccl) still resolves via get_distributed_backend(self.device_type)."""
+def test_init_communication_still_uses_get_distributed_backend_for_tp_gt1_path() -> None:
+    """Accelerator TP>1 still resolves via get_distributed_backend(self.device_type)."""
     fn = _init_comm()
     calls = [c for c in _walk_calls(fn) if _is_get_distributed_backend(c)]
     assert calls, (
@@ -237,7 +243,7 @@ def test_init_communication_return_annotation_is_nullable() -> None:
     # Accept either PEP 604 (X | None) or Optional[X].
     src = ast.unparse(ret)
     assert "None" in src, (
-        "return type must include None to signal the NPU+TP=1 no-op contract, "
+        "return type must include None to signal the MetaX+TP=1 no-op contract, "
         f"got: {src!r}"
     )
 
@@ -302,7 +308,7 @@ def test_sync_get_memory_short_circuits_when_tp_cpu_group_is_none() -> None:
     ]
     assert guards, (
         "_sync_get_memory must guard on `if self.tp_cpu_group is None:` to "
-        "support the NPU+TP=1 no-dist fast path"
+        "support the MetaX+TP=1 no-dist fast path"
     )
     guard = guards[0]
     assert any(isinstance(s, ast.Return) for s in guard.body), (

@@ -2,7 +2,7 @@
 
 Structural + behavioural checks. Rationale:
 
-* On the Ascend container the installed torch build has no CUDA/NVTX; the raw
+* On a CPU-only host the installed torch build has no CUDA/NVTX; the raw
   ``with torch.cuda.nvtx.range("Sampler"):`` used to raise
   ``RuntimeError: NVTX functions not installed.`` from inside the sampler.
 * The outer ``@nvtx_annotate("Sampler")`` decorator (see
@@ -139,7 +139,7 @@ def test_no_unguarded_torch_cuda_nvtx_range_in_minisgl() -> None:
     torch.cuda.is_available() before importing torch.cuda.nvtx."""
     hits: list[tuple[Path, int, str]] = []
     for path in _MINISGL_ROOT.rglob("*.py"):
-        for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             code = line.split("#", 1)[0]
             if _NVTX_RANGE_RE.search(code):
                 hits.append((path, lineno, line))

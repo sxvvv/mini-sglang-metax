@@ -55,41 +55,19 @@ def bind_local_device(device_type: DeviceType, local_rank: int) -> str:
     process-group init.
 
     * ``cuda``: ``torch.cuda.set_device(local_rank)`` → ``"cuda:{local_rank}"``
-    * ``npu``: dynamic ``import torch_npu`` (which patches ``torch.npu`` onto
-      ``torch``), then ``torch.npu.set_device(local_rank)`` → ``"npu:{local_rank}"``
     * ``cpu``: no-op → ``"cpu"``
 
-    ``torch_npu`` is *never* imported at module scope; only this branch, only
-    when the resolved device is ``npu``. Callers on a macOS / CPU-only host
-    may import this module freely.
+    On MetaX the ``cuda`` branch is used, since the vendor ``torch.cuda`` API
+    binds MACA devices.
 
     Raises:
-        RuntimeError: if ``device_type == "npu"`` but ``torch_npu`` cannot be
-            imported.
-        ValueError: if ``device_type`` is not one of ``"cuda"``, ``"npu"``,
-            ``"cpu"``.
+        ValueError: if ``device_type`` is not one of ``"cuda"``, ``"cpu"``.
     """
     if device_type == "cuda":
         import torch  # lazy: only touched on CUDA hosts
 
         torch.cuda.set_device(local_rank)
         return f"cuda:{local_rank}"
-
-    if device_type == "npu":
-        # Safe dynamic import — kept out of module scope so macOS / CPU-only
-        # hosts stay importable.
-        try:
-            import torch_npu  # noqa: F401  (import-for-side-effect: patches torch.npu)
-        except Exception as exc:
-            raise RuntimeError(
-                "device_type is 'npu' but 'torch_npu' could not be imported; "
-                "install the matching torch_npu wheel on the Ascend host"
-            ) from exc
-
-        import torch
-
-        torch.npu.set_device(local_rank)
-        return f"npu:{local_rank}"
 
     if device_type == "cpu":
         return "cpu"
@@ -110,8 +88,7 @@ def initialize_distributed_from_env() -> DistributedRuntime:
     3. Guard against double init: raise ``RuntimeError`` if
        ``torch.distributed.is_initialized()`` is already true. The device is
        not touched in that case.
-    4. Bind the local device (``torch.cuda.set_device`` / ``torch.npu.set_device``
-       / no-op).
+    4. Bind the local device (``torch.cuda.set_device`` or no-op on CPU).
     5. Call ``torch.distributed.init_process_group(backend=backend)`` with
        no ``init_method``, no ``rank``/``world_size`` overrides — the launcher
        (torchrun, MPI, etc.) is expected to supply them via env vars.

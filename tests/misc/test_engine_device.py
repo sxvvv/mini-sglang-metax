@@ -8,7 +8,7 @@ Historical layering:
   :func:`minisgl.distributed.runtime.bind_local_device`.
 * Gate 1.2b routes ``Engine.__init__``'s Stream creation + binding through the
   shared :mod:`minisgl.utils.device_runtime` (``create_stream`` /
-  ``set_stream``) so cuda / npu / cpu all take the same code path.
+  ``set_stream``) so cuda / cpu all take the same code path.
 * Gate 1.3c finishes the migration inside ``Engine.forward_batch``: the raw
   ``torch.cuda.current_stream()`` / ``torch.cuda.Event()`` / ``event.record(...)``
   calls are gone, replaced with the shared ``current_stream`` / ``create_event``
@@ -42,9 +42,10 @@ What's checked here:
    ``reset_peak_memory_stats`` are imported and called in that exact source
    order inside ``_sync_get_memory``; no ``torch.cuda.*`` remains there.
 6. The engine still contains no private device-binding branch (no direct
-   ``torch.cuda.set_device`` / ``torch.npu.set_device`` calls, no
-   ``import torch_npu`` at module scope).
-7. Gate 1.1a's other Ascend-portability guardrails still hold (no hard-coded
+   ``torch.cuda.set_device`` call) and never reaches for a non-CUDA vendor API
+   (no ``torch.npu.set_device`` call, no ``import torch_npu`` at module scope) —
+   on MetaX the vendor ``torch.cuda`` surface is used directly.
+7. The device-agnostic guardrails still hold (no hard-coded
    ``backend="nccl"``, ``get_distributed_backend`` still wired in,
    ``get_device_type`` still consulted).
 8. The single remaining ``TODO(gate-1.2+)`` marker (in ``shutdown``, for
@@ -64,7 +65,7 @@ _ENGINE_PATH = _REPO_ROOT / "python" / "minisgl" / "engine" / "engine.py"
 
 
 def _engine_source() -> str:
-    return _ENGINE_PATH.read_text()
+    return _ENGINE_PATH.read_text(encoding="utf-8")
 
 
 def _engine_tree() -> ast.Module:
@@ -594,7 +595,9 @@ def test_sync_get_memory_still_reads_free_memory_and_all_reduces() -> None:
 
 def test_engine_does_not_call_torch_cuda_set_device_directly() -> None:
     src = _engine_source()
-    assert "torch.cuda.set_device" not in src
+    # Strip line comments so prose about torch.cuda.set_device is not counted.
+    code_only = "\n".join(line.split("#", 1)[0] for line in src.splitlines())
+    assert "torch.cuda.set_device" not in code_only
 
 
 def test_engine_does_not_call_torch_npu_set_device_directly() -> None:
@@ -605,9 +608,8 @@ def test_engine_does_not_call_torch_npu_set_device_directly() -> None:
 def test_engine_does_not_import_torch_npu_at_any_scope() -> None:
     src = _engine_source()
     assert "torch_npu" not in src, (
-        "engine.py must not reference torch_npu — the dynamic import lives "
-        "inside minisgl.distributed.runtime.bind_local_device and "
-        "minisgl.utils.device_runtime"
+        "engine.py must not reference torch_npu — MetaX uses the vendor "
+        "torch.cuda surface, so no torch_npu import should appear at any scope"
     )
 
 
@@ -652,10 +654,10 @@ def test_engine_source_uses_unified_device_type() -> None:
     assert "get_device_type" in src
 
 
-def test_engine_source_still_marks_remaining_deferred_cuda_calls() -> None:
-    """``shutdown``'s CUDA-graph destroy is the last ``TODO(gate-1.2+)`` left."""
+def test_engine_shutdown_still_destroys_cuda_graphs() -> None:
+    """shutdown() must still tear down CUDA graphs (a no-op on the MetaX eager path)."""
     src = _engine_source()
-    assert "TODO(gate-1.2+)" in src
+    assert "destroy_cuda_graphs()" in src
 
 
 # ---------------------------------------------------------------------------
@@ -667,7 +669,7 @@ _GRAPH_PATH = _REPO_ROOT / "python" / "minisgl" / "engine" / "graph.py"
 
 
 def _graph_source() -> str:
-    return _GRAPH_PATH.read_text()
+    return _GRAPH_PATH.read_text(encoding="utf-8")
 
 
 def _graph_tree() -> ast.Module:

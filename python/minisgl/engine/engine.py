@@ -37,9 +37,9 @@ logger = init_logger(__name__)
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
-    # Device-agnostic event handle: torch.cuda.Event on CUDA, torch.npu.Event on
-    # NPU, or None on CPU. The scheduler only calls ``.synchronize()`` on it, so
-    # the concrete backend type is deliberately not exposed here.
+    # Device-agnostic event handle: torch.cuda.Event on CUDA, or None on CPU.
+    # The scheduler only calls ``.synchronize()`` on it, so the concrete backend
+    # type is deliberately not exposed here.
     copy_done_event: Any | None
 
 
@@ -48,16 +48,16 @@ class Engine:
         self.device_type: DeviceType = get_device_type()
         self.platform: AcceleratorPlatform = get_accelerator_platform(self.device_type) # MetaX:  device_type=cuda, platform=metax
         # CUDA has a global "initialised" flag we can assert against for a
-        # clean-slate check. NPU / CPU expose no such API, so the guard is
-        # scoped to the CUDA path rather than silently passing on other hosts.
+        # clean-slate check. CPU exposes no such API, so the guard is scoped to
+        # the CUDA path rather than silently passing on other hosts.
         if self.device_type == "cuda":
             assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
-        _adjust_config(config, self.device_type, self.platform)
+        _adjust_config(config, self.platform)
 
         # Delegate device selection + binding to the shared runtime helper so
         # that Engine and initialize_distributed_from_env() cannot drift on
-        # cuda/npu/cpu handling. bind_local_device sets torch.{cuda,npu}.set_device
+        # cuda/cpu handling. bind_local_device sets torch.cuda.set_device
         # (or no-ops on CPU) and returns the canonical device string, which we
         # wrap into a torch.device for the rest of Engine to consume.
         self.device = torch.device(  # 绑定当前 rank 的设备
@@ -65,11 +65,8 @@ class Engine:
         )
         torch.manual_seed(42)
         # Stream creation + binding routed through the shared device_runtime
-        # dispatch layer: cuda -> torch.cuda.Stream + set_stream, npu -> the
-        # torch.npu equivalents (dynamic Ascend runtime import), cpu -> None +
-        # no-op. Gate 1.3c completes the migration for forward_batch's
-        # current_stream / Event calls too; graph capture + memory helpers are
-        # still deferred.
+        # dispatch layer: cuda -> torch.cuda.Stream + set_stream, cpu -> None +
+        # no-op.
         # 创建模型执行stream，并建立模型各层共享的运行时Context；
         # Context后续保存当前Batch、KV Cache、Page Table和Attention后端
         self.stream = create_stream(self.device_type)
@@ -90,19 +87,14 @@ class Engine:
         self.model.load_state_dict(self._load_weight_state_dict(config))
 
         # ======================= KV cache initialization ========================
-        # ascend 与 nv 的差异
-        # Ascend NPU → bnbsd
-        # CUDA 路径  → nhd
         self.num_pages = self._determine_num_pages(init_free_memory, config)
         num_tokens = self.num_pages * config.page_size
-        kv_cache_layout = "bnbsd" if self.device_type == "npu" else "nhd"
         self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
             model_config=config.model_config,
             num_pages=self.num_pages + 1,  # +1 for dummy page
             page_size=config.page_size,
             device=self.device,
             dtype=self.dtype,
-            layout=kv_cache_layout,
         )
 
         # ======================= Page table initialization ========================
@@ -156,17 +148,14 @@ class Engine:
     def _init_communication(
         self, config: EngineConfig
     ) -> torch.distributed.ProcessGroup | None:
-        # NPU + TP=1: standalone single-rank deployment. Skip torch.distributed
-        # bootstrap entirely — no HCCL group, no gloo sidecar, no pynccl helper.
-        # The CUDA-flavoured pynccl bootstrap unconditionally reaches for
+        # MetaX + TP=1: standalone single-rank deployment. Skip torch.distributed
+        # bootstrap entirely — no gloo sidecar, no pynccl helper. The
+        # CUDA-flavoured pynccl bootstrap unconditionally reaches for
         # ``minisgl.kernel`` (a CUDA-only compile artefact), and the accelerator
         # collectives themselves would be no-ops at world_size=1 anyway. The
         # CUDA path stays untouched: CUDA TP=1 still initialises gloo + calls
         # ``enable_pynccl_distributed`` (which itself is a no-op at size=1) so
-        # test_engine_device's guardrails and the existing GPU control flow
-        # remain unchanged.
-        if self.device_type == "npu" and config.tp_info.size == 1:
-            return None
+        # the existing GPU control flow remains unchanged.
         if self.platform == "metax" and config.tp_info.size == 1:
             return None
 
@@ -186,7 +175,7 @@ class Engine:
             enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
         else:
             # Device-agnostic accelerator collective backend:
-            #   cuda → "nccl", npu → "hccl", cpu → "gloo"
+            #   cuda → "nccl", cpu → "gloo"
             # `gloo` remains the CPU-side sidecar group regardless of accelerator.
             accel_backend = get_distributed_backend(self.device_type)
             torch.distributed.init_process_group(
@@ -237,7 +226,7 @@ class Engine:
         empty_device_cache(self.device_type)
         reset_peak_memory_stats(self.device_type)
         free_memory = get_free_memory(self.device_type, self.device)
-        # NPU + TP=1 no-dist fast path: there is no gloo sidecar group, so
+        # MetaX + TP=1 no-dist fast path: there is no gloo sidecar group, so
         # skip the all_reduce entirely. min == max == the local free_memory
         # value — the imbalance check below is a no-op in that case.
         if self.tp_cpu_group is None:
@@ -297,10 +286,10 @@ class Engine:
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     def shutdown(self) -> None:
-        # TODO(gate-1.2+): CUDA-graph capture/destroy still routes through
-        # torch.cuda; NPU graph capture will land in a later Gate.
+        # CUDA-graph capture/destroy still routes through torch.cuda; it is a
+        # no-op on the MetaX eager path (cuda_graph_bs is forced empty).
         self.graph_runner.destroy_cuda_graphs()
-        # NPU + TP=1 skipped the whole torch.distributed bootstrap, so there
+        # MetaX + TP=1 skipped the whole torch.distributed bootstrap, so there
         # is nothing to destroy here. Mirror the same guard used in
         # _sync_get_memory / _init_communication.
         if self.tp_cpu_group is not None:
@@ -314,7 +303,6 @@ def _align_up_32(num: int) -> int:
 
 def _adjust_config(
     config: EngineConfig,
-    device_type: DeviceType,
     platform: AcceleratorPlatform,
 ):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
@@ -323,10 +311,6 @@ def _adjust_config(
     if config.attention_backend == "auto":
         if platform == "metax":
             backend = "torch_native"
-        elif device_type == "npu":
-            # Ascend NPU uses the FIA-based backend by default; CUDA/CPU
-            # continue to fall through the SM100/SM90/other selection.
-            backend = "npu_fia"
         else:
             backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")
         override("attention_backend", backend)

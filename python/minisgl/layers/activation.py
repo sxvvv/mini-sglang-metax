@@ -37,22 +37,6 @@ def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None):
 
         return flashinfer_silu_and_mul(x, out=out)
 
-    if device_type == "npu":
-        try:
-            import torch_npu
-        except ImportError as exc:
-            raise RuntimeError(
-                "NPU silu_and_mul requires torch_npu to be importable"
-            ) from exc
-
-        result = torch_npu.npu_swiglu(x, dim=-1)
-
-        if out is not None:
-            out.copy_(result)
-            return out
-
-        return result
-
     gate, up = x.float().chunk(2, dim=-1)
     result = (F.silu(gate) * up).to(x.dtype)
 

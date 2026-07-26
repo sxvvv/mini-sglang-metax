@@ -2,7 +2,7 @@
 
 Each import is executed in a fresh Python subprocess with a ``sys.meta_path``
 finder that raises ``ModuleNotFoundError`` for ``flashinfer``, ``sgl_kernel``,
-``quack``, and ``torch_npu``. This guarantees:
+and ``quack``. This guarantees:
 
 1. The subject import truly runs against the real package layout (no
    ``importlib.util.spec_from_file_location`` bypass, no fake stub packages
@@ -13,7 +13,7 @@ finder that raises ``ModuleNotFoundError`` for ``flashinfer``, ``sgl_kernel``,
 Torch and other neutral runtime deps are *not* forcibly available in this
 suite; the test host is expected to be a bare macOS dev box, so the subject
 modules must additionally avoid module-scope ``import torch`` etc. That
-guarantee is implicit in the requirement that they are Ascend-portable.
+guarantee is implicit in the requirement that they stay import-light.
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ _PY_ROOT = _REPO_ROOT / "python"
 
 # The blocker is prepended to every subprocess script. It installs a
 # ``MetaPathFinder`` that raises ``ModuleNotFoundError`` for any import whose
-# top-level package is one of the four Ascend-forbidden CUDA deps. We also
+# top-level package is one of the three CUDA-only deps. We also
 # prepend ``python/`` to ``sys.path`` so subprocesses find the repo source
 # without an ``pip install -e .``.
 _HEADER = f"""\
@@ -38,7 +38,7 @@ sys.path.insert(0, {str(_PY_ROOT)!r})
 
 import importlib.abc
 
-_BLOCKED = {{"flashinfer", "sgl_kernel", "quack", "torch_npu"}}
+_BLOCKED = {{"flashinfer", "sgl_kernel", "quack"}}
 
 
 class _Blocker(importlib.abc.MetaPathFinder):
@@ -103,13 +103,13 @@ def test_target_module_imports_without_cuda_deps(target: str) -> None:
 
 @pytest.mark.parametrize("pkg", ["minisgl.utils", "minisgl.distributed"])
 def test_package_init_does_not_pull_cuda_deps(pkg: str) -> None:
-    """``import minisgl.utils`` alone must not load flashinfer/sgl_kernel/quack/torch_npu."""
+    """``import minisgl.utils`` alone must not load flashinfer/sgl_kernel/quack."""
     body = (
         f"import {pkg}\n"
         # ``sys.modules`` must not contain any blocked package after init.
         "import sys\n"
         "leaked = sorted(m for m in sys.modules if m.split('.', 1)[0] in "
-        "{'flashinfer', 'sgl_kernel', 'quack', 'torch_npu'})\n"
+        "{'flashinfer', 'sgl_kernel', 'quack'})\n"
         "assert leaked == [], f'leaked CUDA deps: {leaked!r}'\n"
         f"print('OK:{pkg}')\n"
     )
@@ -182,7 +182,7 @@ def test_arch_runs_under_natural_import() -> None:
         "assert arch.is_sm100_supported() is False\n"
         "import sys\n"
         "leaked = sorted(m for m in sys.modules if m.split('.', 1)[0] in "
-        "{'flashinfer', 'sgl_kernel', 'quack', 'torch_npu'})\n"
+        "{'flashinfer', 'sgl_kernel', 'quack'})\n"
         "assert leaked == [], f'leaked CUDA deps: {leaked!r}'\n"
         "print('OK:arch')\n"
     )
@@ -191,27 +191,11 @@ def test_arch_runs_under_natural_import() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. Runtime module still refuses to import ``torch_npu`` at module scope
+# 5. Sanity: the blocker really does block direct imports
 # ---------------------------------------------------------------------------
 
 
-def test_runtime_module_scope_does_not_import_torch_npu() -> None:
-    body = (
-        "import minisgl.distributed.runtime  # noqa: F401\n"
-        "import sys\n"
-        "assert 'torch_npu' not in sys.modules, sorted(sys.modules)\n"
-        "print('OK:runtime-clean')\n"
-    )
-    result = _run(body)
-    _assert_ok(result, "OK:runtime-clean")
-
-
-# ---------------------------------------------------------------------------
-# 6. Sanity: the blocker really does block direct imports
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("blocked", ["flashinfer", "sgl_kernel", "quack", "torch_npu"])
+@pytest.mark.parametrize("blocked", ["flashinfer", "sgl_kernel", "quack"])
 def test_blocker_actually_blocks_direct_import(blocked: str) -> None:
     body = (
         f"try:\n"

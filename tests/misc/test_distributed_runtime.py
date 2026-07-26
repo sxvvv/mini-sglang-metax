@@ -1,10 +1,10 @@
 """Unit tests for :mod:`minisgl.distributed.runtime`.
 
-The runtime initialiser touches ``torch`` and optionally ``torch_npu``. This
-suite fakes both via ``sys.modules`` injection so it runs on a bare macOS host
-without any real torch/CUDA/NPU install. As with the sibling suites the
-modules under test are loaded via ``importlib.util`` to bypass the package
-``__init__`` files that import the heavier optional runtime deps.
+The runtime initialiser touches ``torch`` (and ``torch.cuda`` on accelerator
+hosts). This suite fakes ``torch`` via ``sys.modules`` injection so it runs on
+a bare CPU-only host without any real torch/CUDA install. As with the sibling
+suites the modules under test are loaded via ``importlib.util`` to bypass the
+package ``__init__`` files that import the heavier optional runtime deps.
 """
 from __future__ import annotations
 
@@ -65,26 +65,21 @@ def _install_fake_torch(
     *,
     already_initialised: bool = False,
 ) -> types.ModuleType:
-    """Inject a minimal fake ``torch`` (with ``.cuda`` / ``.npu`` / ``.distributed``)."""
+    """Inject a minimal fake ``torch`` (with ``.cuda`` / ``.distributed``)."""
     fake_torch = types.ModuleType("torch")
 
     fake_cuda = types.ModuleType("torch.cuda")
     fake_cuda.set_device = lambda idx: log.record("cuda.set_device", idx)
-
-    fake_npu = types.ModuleType("torch.npu")
-    fake_npu.set_device = lambda idx: log.record("npu.set_device", idx)
 
     fake_dist = types.ModuleType("torch.distributed")
     fake_dist.is_initialized = lambda: already_initialised
     fake_dist.init_process_group = lambda **kw: log.record("init_process_group", kw)
 
     fake_torch.cuda = fake_cuda
-    fake_torch.npu = fake_npu
     fake_torch.distributed = fake_dist
 
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
     monkeypatch.setitem(sys.modules, "torch.cuda", fake_cuda)
-    monkeypatch.setitem(sys.modules, "torch.npu", fake_npu)
     monkeypatch.setitem(sys.modules, "torch.distributed", fake_dist)
     return fake_torch
 
@@ -96,33 +91,12 @@ def _set_env(monkeypatch: pytest.MonkeyPatch, **values: str) -> None:
         monkeypatch.setenv(k, v)
 
 
-def _install_torch_npu(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fake ``torch_npu`` — mere presence in ``sys.modules`` is enough."""
-    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
-
-
-def _install_torch_npu_import_hook(
-    monkeypatch: pytest.MonkeyPatch, exc: BaseException
-) -> None:
-    monkeypatch.delitem(sys.modules, "torch_npu", raising=False)
-    real_import = __import__
-
-    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):  # noqa: A002
-        if name == "torch_npu" or name.startswith("torch_npu."):
-            raise exc
-        return real_import(name, globals, locals, fromlist, level)
-
-    monkeypatch.setattr("builtins.__import__", fake_import)
-
-
 @pytest.fixture(autouse=True)
 def _reset_device_cache():
     device.is_cuda_available.cache_clear()
-    device.is_npu_available.cache_clear()
     device.get_device_type.cache_clear()
     yield
     device.is_cuda_available.cache_clear()
-    device.is_npu_available.cache_clear()
     device.get_device_type.cache_clear()
 
 
@@ -151,32 +125,6 @@ def test_cuda_binds_local_rank_and_selects_nccl(monkeypatch: pytest.MonkeyPatch)
         ("cuda.set_device", 1),
         ("init_process_group", {"backend": "nccl"}),
     ]
-
-
-def test_npu_imports_torch_npu_binds_local_rank_and_selects_hccl(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    log = _CallLog()
-    _install_fake_torch(monkeypatch, log)
-    _install_torch_npu(monkeypatch)
-    monkeypatch.setattr(runtime, "get_device_type", lambda: "npu")
-    _set_env(monkeypatch, LOCAL_RANK="2", RANK="2", WORLD_SIZE="8")
-
-    result = runtime.initialize_distributed_from_env()
-
-    assert result.device_type == "npu"
-    assert result.backend == "hccl"
-    assert result.device == "npu:2"
-    assert result.local_rank == 2
-    assert result.rank == 2
-    assert result.world_size == 8
-
-    assert log.events == [
-        ("npu.set_device", 2),
-        ("init_process_group", {"backend": "hccl"}),
-    ]
-    # torch_npu must have been imported dynamically.
-    assert "torch_npu" in sys.modules
 
 
 def test_cpu_does_not_touch_set_device_and_selects_gloo(
@@ -300,34 +248,17 @@ def test_init_process_group_receives_selected_backend(
 
 
 # ---------------------------------------------------------------------------
-# torch_npu import failure
+# torch_npu absence guard
 # ---------------------------------------------------------------------------
 
 
-def test_npu_selected_but_torch_npu_import_fails_raises_runtime_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    log = _CallLog()
-    _install_fake_torch(monkeypatch, log)
-    monkeypatch.setattr(runtime, "get_device_type", lambda: "npu")
-    _install_torch_npu_import_hook(monkeypatch, ImportError("no torch_npu wheel"))
-    _set_env(monkeypatch, LOCAL_RANK="0", RANK="0", WORLD_SIZE="1")
-
-    with pytest.raises(RuntimeError, match="torch_npu"):
-        runtime.initialize_distributed_from_env()
-
-    # Failure must land BEFORE init_process_group — no group must be created.
-    assert not any(e[0] == "init_process_group" for e in log.events)
-
-
 def test_runtime_module_does_not_import_torch_npu_at_module_scope() -> None:
-    """Loading ``runtime`` must not pull in ``torch_npu`` — only device-npu path does."""
-    # ``runtime`` was loaded at test-module import time above; if it had
-    # ``import torch_npu`` at the top level we would see it in sys.modules
-    # already (no test has run the NPU path yet under this specific assertion).
-    # We therefore only check that the runtime module object itself has no
-    # ``torch_npu`` attribute — a weaker but robust proxy given the shared
-    # sys.modules state across parametrised tests.
+    """``runtime`` must never reference ``torch_npu`` at any scope.
+
+    MetaX drives its accelerator through the vendor ``torch.cuda`` surface, so
+    ``torch_npu`` must not leak into the runtime module namespace. This is a
+    standing absence guard against an Ascend-era import creeping back in.
+    """
     assert not hasattr(runtime, "torch_npu")
 
 
@@ -350,19 +281,6 @@ def test_bind_local_device_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert device == "cuda:3"
     assert log.events == [("cuda.set_device", 3)]
-
-
-def test_bind_local_device_npu(monkeypatch: pytest.MonkeyPatch) -> None:
-    log = _CallLog()
-    _install_fake_torch(monkeypatch, log)
-    _install_torch_npu(monkeypatch)
-
-    device = runtime.bind_local_device("npu", 5)
-
-    assert device == "npu:5"
-    assert log.events == [("npu.set_device", 5)]
-    # The dynamic import must have populated sys.modules.
-    assert "torch_npu" in sys.modules
 
 
 def test_bind_local_device_cpu_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -395,19 +313,6 @@ def test_bind_local_device_invalid_type_raises_value_error(
 
     with pytest.raises(ValueError, match="tpu"):
         runtime.bind_local_device("tpu", 0)  # type: ignore[arg-type]
-    assert log.events == []
-
-
-def test_bind_local_device_npu_import_failure_raises_runtime_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    log = _CallLog()
-    _install_fake_torch(monkeypatch, log)
-    _install_torch_npu_import_hook(monkeypatch, ImportError("no torch_npu wheel"))
-
-    with pytest.raises(RuntimeError, match="torch_npu"):
-        runtime.bind_local_device("npu", 0)
-    # Failure must land BEFORE any set_device call.
     assert log.events == []
 
 

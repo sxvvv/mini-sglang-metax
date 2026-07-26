@@ -9,8 +9,8 @@ device-agnostic helpers such as :mod:`minisgl.distributed.backend` and
     import minisgl.distributed.backend    # never touches .impl / torch
     import minisgl.distributed.runtime    # never touches .impl / torch
 
-remain safe on Ascend hosts (or a bare macOS dev box) that lack the CUDA
-runtime, PyNCCL, or ``torch_npu``. Legacy consumers using
+remain safe on CPU-only hosts (or a bare macOS dev box) that lack the CUDA
+runtime or PyNCCL. Legacy consumers using
 ``from minisgl.distributed import DistributedInfo`` etc. continue to work
 untouched — the owning submodule executes on first access instead of at
 import time.
