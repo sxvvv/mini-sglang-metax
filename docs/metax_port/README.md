@@ -1,48 +1,60 @@
-# MetaX documentation index
+# MetaX Port — Technical Notes
 
-## Scope boundary
+This directory contains technical documentation for the MetaX C500/C550 adaptation of mini-sglang.
 
-This directory is the current MetaX product and evidence surface. MetaX uses
-the MACA/MCCL vendor stack and a CUDA-facing vendor PyTorch API, but it is not
-the NVIDIA CUDA backend and it does not use the Ascend `torch_npu`/CANN/HCCL
-route. Files under `docs/ascend_port/` are retained only as provenance,
-device-abstraction history, and compatibility references; they are not MetaX
-validation evidence.
+## Design: platform / device_type decoupling
 
-Current evidence:
+MetaX vendor PyTorch surfaces GPU devices through `torch.cuda`, making the
+device API identical to NVIDIA. However, NVIDIA-compiled extensions (FlashInfer,
+`sgl_kernel`, CUDA Graph, PyNCCL) do not run on MACA.
 
-- [`../../PROVENANCE.md`](../../PROVENANCE.md): project overview, architecture,
-  borrowed foundations, attribution, and MetaX adaptation boundary.
-- [`gate0_verdict.md`](gate0_verdict.md): formal real-hardware verdict.
-- [`online_gate1_verdict.md`](online_gate1_verdict.md): bounded online API Gate 1.
-- [`online_gate1_1_verdict.md`](online_gate1_1_verdict.md): SSE, cancellation,
-  concurrency, and recovery Gate 1.1.
-- [`online_gate1_2_verdict.md`](online_gate1_2_verdict.md): bounded soak,
-  overload queueing, real scheduler batching, and fault recovery.
-- [`vendor_attention_verdict.md`](vendor_attention_verdict.md): installed
-  `flashinfer`/`mcoplib` inventory and experimental real-model `fi` verdict.
-- [`tp2_resource_blocker.md`](tp2_resource_blocker.md): exact single-card
-  blocker for the real-model TP2 online matrix.
-- [`open_source_readiness.md`](open_source_readiness.md): public release
-  hygiene, supported claims, and remaining hardware blockers.
-- [`bringup_result_2026-07-23.md`](bringup_result_2026-07-23.md): detailed
-  environment, synthetic TP2/TP8, and real Qwen3-8B evidence.
-- [`../../REPORT.md`](../../REPORT.md): management and Jira-ready summary.
+The port separates two things the upstream code treats as one:
 
-Execution contract:
+```
+device_type = "cuda"   # PyTorch API surface — torch.cuda.*, streams, events
+platform    = "metax"  # Hardware vendor — controls kernel and backend routing
+```
 
-- [`gate0.md`](gate0.md): original correctness-first Gate 0 contract.
-- `scripts/metax/preflight.py`: device and operator preflight.
-- `scripts/metax/run_gate0.sh`: persistent report-producing runner.
-- `scripts/metax/run_tiny_e2e.py`: repeated-request offline driver.
-- `scripts/metax/run_online_gate1.sh`: bounded non-streaming online runner.
-- `scripts/metax/run_online_gate1_1.sh`: SSE/cancellation/concurrency runner.
-- `scripts/metax/run_online_gate1_2.sh`: bounded soak and batching runner.
-- `scripts/metax/vendor_inventory.py`: reproducible vendor package inventory.
+On NVIDIA both values agree. On MetaX they intentionally disagree:
+`device_type` stays `"cuda"` so all PyTorch device plumbing works; `platform`
+flips to `"metax"` so the code routes around compiled NVIDIA extensions.
 
-Planning history:
+```
+┌─────────────────────────────────────────────────────────┐
+│                  mini-sglang-metax                       │
+│                                                          │
+│  Python / PyTorch layer  (portable, device_type="cuda") │
+│         ↓                                                │
+│  platform == "metax" ?                                   │
+│     ├── attention  →  torch_native  (eager matmul)       │
+│     ├── MoE        →  MetaxMoe      (pure-PyTorch)       │
+│     ├── TP comm    →  MCCL via torch.distributed         │
+│     └── KV cache   →  index_copy_  (no fused kernel)     │
+│                                                          │
+│  platform == "nvidia" ?                                  │
+│     ├── attention  →  FlashAttention / FlashInfer        │
+│     ├── MoE        →  sgl_kernel fused_moe               │
+│     ├── TP comm    →  NCCL / PyNCCL                      │
+│     └── KV cache   →  store_cache CUDA kernel            │
+└─────────────────────────────────────────────────────────┘
+```
 
-- `project_plan.md`, `todo.md`, `daily_report_2026-07-23.md`,
-  `weekly_report_2026-07-23.md`, and `jira_draft.md` were written before the
-  real C500/C550 runs. Statements in those files saying that hardware evidence
-  was unavailable are historical. The current verdicts above supersede them.
+## MoE Backend: MetaxMoe (M1)
+
+SGLang's default `fused_moe` backend calls into `sgl_kernel` (NVIDIA-compiled).
+`MetaxMoe` is a pure-PyTorch drop-in replacement registered as `"metax"` in the
+backend registry. The engine selects it automatically when `platform == "metax"`.
+
+Key implementation choices:
+- Router: `torch.softmax` + `torch.topk` (replaces `sgl_kernel.topk_softmax`)
+- Expert loop: gather → gate-up proj → SiLU → down proj → scatter-add
+- Supports `silu`/`gelu`, `renormalize`, `apply_router_weight_on_input`
+- 20 CPU unit tests — no GPU required to verify correctness
+
+See [`python/minisgl/moe/metax.py`](../../python/minisgl/moe/metax.py) and
+[`tests/moe/test_metax_moe.py`](../../tests/moe/test_metax_moe.py).
+
+## Optimization directions
+
+See [`step35_optimization_directions.md`](step35_optimization_directions.md)
+for the current performance analysis and next-step priorities on 30B MoE models.
