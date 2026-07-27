@@ -108,7 +108,7 @@
 
 **背景**
 
-checkpoint 路径：`/mxstorage/pde_ai/models/model_quant_opt/Stepfun/step3_5_W8A8/vllm_quant_model_with_mtp`  
+checkpoint：Step-3.5 W8A8 MTP variant（`num_nextn_predict_layers=3`）  
 模型配置：`num_nextn_predict_layers=3`  
 SGLang 0.5.13 识别了 Step3p5 EAGLE 路径（`Enable multi-layer EAGLE speculative decoding for Step3p5ForCausalLM model.`）。
 
@@ -285,6 +285,5 @@ def get_default_config(M, E, N, K, topk, platform="cuda"):
 - 基线（Prefill）：`SGLang-C500-TP8-4096x1-基线结果-2026-07-17.md`
 - 基线（Decode）：`SGLang-C500-TP8-Decode基线与Profiling进展-2026-07-17.md`
 - 环境记录：`SGLang-C500-Step3.7-TP8当前环境.md`
-- C550 JIT 修复参考：`MC3-12293-C550-Profiling-Jira更新-2026-07-15.md`
 - MoE kernel 实现：`mini-sglang-metax/python/minisgl/moe/fused.py`
 - Attention 实现：`mini-sglang-metax/python/minisgl/attention/torch_native.py`
