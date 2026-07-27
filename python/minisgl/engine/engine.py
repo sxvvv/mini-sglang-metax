@@ -317,10 +317,6 @@ def _adjust_config(
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
 
     if platform == "metax":
-        if config.model_config.is_moe:
-            raise NotImplementedError(
-                "MetaX Gate 0 supports dense models only; MoE requires a validated MACA kernel backend"
-            )
         if config.cuda_graph_bs != []:
             override("cuda_graph_bs", [])
         if config.cuda_graph_max_bs != 0:
@@ -336,5 +332,8 @@ def _adjust_config(
         logger.warning_rank0("Page size is overridden to 64 for TRTLLM backend")
 
     if config.model_config.is_moe and config.moe_backend == "auto":
-        override("moe_backend", "fused")
+        # On MetaX hardware use the pure-PyTorch backend (no sgl_kernel NVIDIA deps).
+        # On all other platforms fall back to the Triton fused kernel.
+        backend = "metax" if platform == "metax" else "fused"
+        override("moe_backend", backend)
         logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")

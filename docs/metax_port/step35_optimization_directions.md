@@ -4,7 +4,7 @@
 > 模型：Step-3.5 W8A8（`vllm_quant_model_main`，30B+ MoE，45 层，TP8）  
 > 设备：MetaX C500，8 卡  
 > 框架：SGLang 0.5.13（MetaX 定制版）  
-> 当前状态：Decode sweep 已完成（C500 TP8，2026-07-27 08:45–08:56 CST）
+> 当前状态：MTP smoke 进行中（2026-07-27 10:26– CST），M1（MetaX PyTorch MoE backend）已完成
 
 ---
 
@@ -52,7 +52,7 @@
 
 | 开关 | 原因 | 待解决 |
 |---|---|---|
-| `SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=0` | JIT 编译在 MetaX 上失败（libcudart 路径缺失） | 应用 C550 的 libcudart symlink 修复 |
+| `SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=0` | JIT 编译在 MetaX 上失败（libcudart 路径缺失）；**已测试 JIT=1（2026-07-27）：patch 了 `moe_fused_gate.py` 中 `routed_scaling_factor=None` crash，但 MACA Triton JIT kernel 性能与 fallback 相当（TPOT 271ms vs 274ms，噪声级别）** | **维持 JIT=0，不再追踪** |
 | `--disable-cuda-graph` | MetaX 尚未实测 Graph 可用性 | 探索性验证（低优先） |
 | `--disable-radix-cache` | 正确性未在 MetaX 上验证 | 先做 smoke，再开启 |
 | `--json-model-override-args '{"routed_scaling_factor":3.0}'` | checkpoint 字段命名不一致 | 已 workaround，结构性解决需上游修复 |
@@ -61,35 +61,31 @@
 
 ## 2. 优化方向
 
-### 方向 A：JIT Fused TopK 修复（高优先，低风险）
+### 方向 A：JIT Fused TopK ~~修复~~（**已关闭**，2026-07-27）
 
-**背景**
+**结论：MACA Triton JIT 无提升，维持 `SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=0`**
 
-`SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=0` 强制退回慢路径。  
-C550 上的修复已验证：SGLang JIT 按名称查找 `libcudart.so`，而 MetaX 的 CUDA Runtime shim 位于 `/opt/maca/tools/cu-bridge/lib/libcuda.so`，名称不匹配。
+#### A/B 实测结果（c=64，Step-3.5 W8A8 C500 TP8）
 
-**修复步骤**
+| 指标 | JIT=0（基线） | JIT=1（实测） | Δ |
+|---|---|---|---|
+| req/s | 1.63 | 1.62 | −0.6%（噪声） |
+| TTFT (ms) | 3 233 | 3 026 | −6%（波动范围内） |
+| TPOT (ms) | 274 | 271.6 | −0.9%（噪声） |
+| ITL (ms) | 202 | 202 | 0% |
 
-```bash
-# 1. 确认 shim 导出 Runtime 符号
-nm -D /opt/maca/tools/cu-bridge/lib/libcuda.so | grep cudaMalloc
+**过程记录**
 
-# 2. 创建名称映射（仅影响 JIT 链接，不替换系统库）
-mkdir -p ~/cuda-runtime-lib
-ln -s /opt/maca/tools/cu-bridge/lib/libcuda.so ~/cuda-runtime-lib/libcudart.so
+- libcudart symlink 修复已应用：`ln -s /opt/maca/tools/cu-bridge/lib/libcuda.so ~/cuda-runtime-lib/libcudart.so`
+- JIT 编译成功，server 正常启动（09:21:52 CST）
+- `moe_fused_gate.py` Bug 发现并已 patch：`float(routed_scaling_factor if routed_scaling_factor is not None else 1.0)`（Step-3.5 checkpoint 中 `routed_scaling_factor` 为 None，JIT 路径无 None guard）
+- Benchmark（c=64, n=128）完整运行通过，所有指标与 JIT=0 在误差范围内持平
 
-# 3. 注入到编译和运行链路
-export LIBRARY_PATH=$HOME/cuda-runtime-lib:$LIBRARY_PATH
-export LD_LIBRARY_PATH=$HOME/cuda-runtime-lib:$LD_LIBRARY_PATH
+**结论分析**：MACA Triton JIT 编译的 `biased_topk` kernel 与 PyTorch fallback 路径在 C500 上性能相当。可能原因：
+1. MACA Triton 后端生成的 ISA 与 C500 native 实现等效
+2. Step-3.5 MoE routing 的 TopK 操作不是当前瓶颈（瓶颈在 Decode Attention 串行 dispatch，即方向 E3）
 
-# 4. 最小验证
-python -c "import ctypes; ctypes.CDLL('libcudart.so'); print('cudart binding OK')"
-
-# 5. 去掉 workaround 重新启动服务，观察启动日志是否有 JIT 编译信息
-# SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK 不再设为 0
-```
-
-**预期影响**：MoE Router 每层都有 TopK 调用；JIT fused 路径比回退路径快（具体提升取决于 MACA Triton JIT 生成的 kernel 质量，但方向确定为正向）。
+**行动**：`SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=0` 维持现状，方向 A 关闭。
 
 ---
 
@@ -108,33 +104,33 @@ python -c "import ctypes; ctypes.CDLL('libcudart.so'); print('cudart binding OK'
 
 ---
 
-### 方向 C：MTP（Multi-Token Prediction）Smoke（中优先，中风险）
+### 方向 C：MTP（Multi-Token Prediction）Smoke（**进行中**，2026-07-27）
 
 **背景**
 
 checkpoint 路径：`/mxstorage/pde_ai/models/model_quant_opt/Stepfun/step3_5_W8A8/vllm_quant_model_with_mtp`  
 模型配置：`num_nextn_predict_layers=3`  
-SGLang 0.5.13 对 Step3p5 MTP 的 MetaX 兼容性**尚未验证**。
+SGLang 0.5.13 识别了 Step3p5 EAGLE 路径（`Enable multi-layer EAGLE speculative decoding for Step3p5ForCausalLM model.`）。
 
-**实验步骤（渐进式）**
+**实验脚本**：`scripts/metax/mtp_smoke.sh`，STEP=1（load-only验证）
+
+**已发现并修复的 bug**
+
+| # | 错误 | 修复 |
+|---|---|---|
+| 1 | `--num-speculative-steps` → `unrecognized arguments` | 改为 `--speculative-num-steps` |
+| 2 | `speculative_eagle_topk > 1` → `TypeError: '>' not supported … NoneType` | 加入 `--speculative-eagle-topk 1` |
+| 3 | 旧 minisgl Qwen3-8B server（port 1919）占用 GPU 0 compute queue | 启动 MTP smoke 前先 kill 旧 server |
+
+**当前状态（2026-07-27 10:35 CST）**
+
+- 服务器正在加载模型：`Multi-thread loading shards: 2% | 1/44, ~4min`
+- W8A8 量化正确识别：`CompressedTensorsW8A8Int8DynamicMoE`
+- 结论待定（READY 后确认）
 
 ```bash
-# Step 1：只验证模型能否加载（不做推理）
 # 在启动日志中确认 MTP 层数被正确识别
-MODEL=/mxstorage/pde_ai/models/model_quant_opt/Stepfun/step3_5_W8A8/vllm_quant_model_with_mtp
-env SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=0 \
-  python -m sglang.launch_server \
-  --model-path "$MODEL" --host 0.0.0.0 --port 30001 \
-  --tp-size 8 --mem-fraction-static 0.7 \
-  --disable-cuda-graph --disable-piecewise-cuda-graph \
-  --disable-radix-cache \
-  --json-model-override-args '{"routed_scaling_factor":3.0}' \
-  --speculative-algorithm EAGLE \
-  --num-speculative-steps 3 \
-  2>&1 | head -100
-
-# Step 2：如果加载成功，发单个请求验证输出正确性
-# Step 3：如果正确性通过，做同口径 A/B throughput 对比
+# （从 scripts/metax/mtp_smoke.sh 启动，含所有必要 flag）
 ```
 
 **预期影响**：MTP/EAGLE 在 decode-heavy 负载下可提升 2–3× 输出吞吐（取决于 draft acceptance rate）。  
@@ -142,42 +138,34 @@ env SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=0 \
 
 ---
 
-### 方向 D：RadixCache 正确性 Smoke（中优先，低代码风险）
+### 方向 D：RadixCache 正确性 Smoke（**已测试**，2026-07-27）
 
-**背景**
+**结论：RadixCache 在 C500 上无 cache 命中，`--disable-radix-cache` 暂维持**
 
-`--disable-radix-cache` 是保守禁用，非功能性障碍。mini-sglang-metax 的 RadixCache 实现已存在（`kvcache/radix_cache.py`）且在通用测试中通过。
+#### Smoke 实测结果
 
-**实验步骤**
+| 指标 | req-1（cold） | req-2（warm） |
+|---|---|---|
+| TTFT | 9.15s | 9.22s |
+| TTFT ratio | — | **1.007**（期望 < 0.50） |
+| 输出 | `运，\n调度器设计...` | `</think>\n</think>\nSGLang...` |
 
-```bash
-# 1. 去掉 --disable-radix-cache，同时缩小规模确保不影响正在跑的任务
-# 2. 用相同 prompt 发两次请求，验证第二次 TTFT 明显低于第一次
-# 3. 验证两次输出内容一致（greedy decoding）
+- **无 TTFT 减少**：RadixCache prefix lookup 完全未命中
+- **输出不一致**：Step-3.5 是 thinking model，temperature=0 下 int8 MoE 仍有非确定性（`</think>` token 结构），与 RC 无直接关系（因为 TTFT 未降低，说明第二次请求走了全量 prefill，而非 RC 复用）
 
-# smoke 脚本示例：
-python - <<'EOF'
-import requests, json
+**根本原因（待查）**：
 
-PROMPT = "请介绍 SGLang 框架的调度器设计。" * 200  # ~4000 chars
+可能原因一：RadixCache tree 的 token hash 匹配逻辑在 MetaX 环境下未正确触发（需对比 `kvcache/radix_cache.py` 的 `insert()` / `match_prefix()` 路径）
 
-def chat(prompt):
-    resp = requests.post("http://localhost:30000/v1/chat/completions",
-        json={"model": "step3.5", "messages":[{"role":"user","content":prompt}],
-              "max_tokens": 32, "temperature": 0})
-    return resp.json()
+可能原因二：Step-3.5 的 tokenizer 对长重复文本产生不一致的 token sequence（需打印实际 token ids 验证）
 
-r1 = chat(PROMPT)
-r2 = chat(PROMPT)
-print("TTFT 1:", r1.get("usage"))
-print("TTFT 2:", r2.get("usage"))
-assert r1["choices"][0]["message"]["content"] == r2["choices"][0]["message"]["content"], "输出不一致！"
-print("RadixCache smoke: PASSED")
-EOF
-```
+可能原因三：MetaX 上 KV cache 的 attention backend（`torch_native`）未正确与 RadixCache 的 cache slots 对接
 
-**预期影响**：在真实对话流量（高前缀重用率）下可将 TTFT 降低 30–70%，random-ids 基线不受影响（无前缀复用）。  
-**风险**：若 MetaX 上 KV cache 读写有未检测的精度问题，smoke 会发现输出不一致。
+**行动**：
+1. `--disable-radix-cache` 维持现状，方向 D 标记为"待诊断"
+2. 后续调查：在 `radix_cache_smoke.sh` 中加打印 cache hit stats（`/get_server_info` endpoint）
+
+**脚本**：已提交至 `scripts/metax/radix_cache_smoke.sh`
 
 ---
 
@@ -208,27 +196,26 @@ def get_default_config(M, E, N, K, topk, platform="cuda"):
 
 **预期影响**：MoE GEMM 在 Prefill 阶段占主导，block size 调优可带来 10–30% 的 kernel 级别提升。
 
-#### E2：MetaX-native TopK 和 MoE Align 替代实现
+#### E2：MetaX-native TopK 和 MoE Align 替代实现（**M1 已完成**，2026-07-27）
 
 **背景**
 
 `moe/fused.py` 的 `fused_topk()` 和 `moe_align_block_size()` 分别依赖 `sgl_kernel.topk_softmax` 和 `sgl_kernel.moe_align_block_size`，这两者均为 NVIDIA 编译产物，在 MetaX 上不可用，因此必须绕过（`SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=0`）。
 
-**方向**：在 `minisgl.kernel` 或 `minisgl.moe` 下提供 platform=metax 时的纯 Triton / PyTorch 替代：
+**M1 实现状态：已完成**
 
-```python
-# python/minisgl/kernel/moe_metax.py（新增）
-def topk_softmax_metax(topk_weights, topk_ids, gating_output, renormalize):
-    """纯 PyTorch 实现，无 sgl_kernel 依赖"""
-    scores = torch.softmax(gating_output.float(), dim=-1)
-    topk_weights_, topk_ids_ = torch.topk(scores, k=topk_weights.shape[1], dim=-1)
-    topk_weights.copy_(topk_weights_)
-    topk_ids.copy_(topk_ids_.to(torch.int32))
+新建文件 [`python/minisgl/moe/metax.py`](../../python/minisgl/moe/metax.py)，实现 `MetaxMoe(BaseMoeBackend)`：
 
-def moe_align_block_size_metax(topk_ids, block_size, num_experts):
-    """纯 PyTorch 替代，避免 sgl_kernel 依赖"""
-    ...
-```
+- 路由：纯 PyTorch `torch.softmax + torch.topk`（替代 `sgl_kernel.topk_softmax`）
+- Expert 计算：Python for-loop 逐 expert gather/scatter（无 `moe_align_block_size` 依赖）
+- 激活：SwiGLU / GeGLU
+- 支持 `renormalize`、`apply_router_weight_on_input`、topk≥1
+
+注册到 `moe/__init__.py`（`SUPPORTED_MOE_BACKENDS["metax"]`），`engine.py` 在 `platform=="metax"` 时自动选择。
+
+测试：[`tests/moe/test_metax_moe.py`](../../tests/moe/test_metax_moe.py)，20 测试全部通过（CPU）。
+
+**下一步（M2）**：用 MACA Triton grouped-matmul 替代 Python 循环，消除 O(E) Python dispatch 开销。
 
 #### E3：Decode 阶段批量 Paged Attention 内核
 
@@ -258,16 +245,19 @@ def moe_align_block_size_metax(topk_ids, block_size, num_experts):
 ┌─────────────────────────────────────────────────────────┐
 │  立即可做（本周，SGLang 0.5.13 生产路径）                │
 │                                                         │
-│  A → Decode sweep（B）                                  │
+│  ~~A（JIT TopK）~~ ← 已关闭，无提升                    │
+│  ~~D（RadixCache smoke）~~ ← 已测试，无 cache hit       │
+│                                                         │
+│  C（MTP smoke）← 当前（进行中，2026-07-27）             │
 │       ↓                                                 │
-│  C（MTP smoke，需要A先稳定）                            │
-│       ↓                                                 │
-│  D（RadixCache smoke，独立分支）                        │
+│  B 高并发（c=192/256 饱和点）                           │
 └─────────────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────────────┐
 │  mini-sglang-metax 中长期（下一个 Gate）                │
 │                                                         │
-│  E2（MetaX native TopK/Align）                         │
+│  ~~E2（MetaX native TopK/Align）~~ ← M1 已完成         │
+│       ↓                                                 │
+│  M2：MACA Triton grouped-matmul 替换 Python loop        │
 │       ↓                                                 │
 │  E1（C500 MoE Triton 调优）                             │
 │       ↓                                                 │

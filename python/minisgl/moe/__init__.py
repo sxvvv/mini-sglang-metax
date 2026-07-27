@@ -23,6 +23,13 @@ def create_fused_moe_backend():
     return FusedMoe()
 
 
+@SUPPORTED_MOE_BACKENDS.register("metax")
+def create_metax_moe_backend():
+    from .metax import MetaxMoe
+
+    return MetaxMoe()
+
+
 def create_moe_backend(backend: str) -> BaseMoeBackend:
     return SUPPORTED_MOE_BACKENDS[backend]()
 
